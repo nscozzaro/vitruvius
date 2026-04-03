@@ -26,12 +26,15 @@ interface DataCollectionProps {
 
 export default function DataCollection({ geocoded, onComplete }: DataCollectionProps) {
   const [steps, setSteps] = useState<Step[]>([
-    { label: "Building footprint (OSM)", status: "pending" },
+    { label: "Building footprint", status: "pending" },
     { label: "Street imagery", status: "pending" },
-    { label: "Assessor records", status: "pending" },
-    { label: "Elevation data (USGS)", status: "pending" },
+    { label: "Property records", status: "pending" },
+    { label: "Elevation data", status: "pending" },
     { label: "Listing photos", status: "pending" },
   ]);
+
+  const doneCount = steps.filter((s) => s.status === "done" || s.status === "error").length;
+  const progress = (doneCount / steps.length) * 100;
 
   useEffect(() => {
     const { latitude: lat, longitude: lon, address } = geocoded;
@@ -44,7 +47,6 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
 
     const results: Partial<CollectionResults> = { geocoded };
 
-    // Run all 5 collectors in parallel
     const collectors = [
       async () => {
         updateStep(0, { status: "loading" });
@@ -54,7 +56,7 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
           const pts = r.footprint?.length ?? 0;
           updateStep(0, {
             status: "done",
-            detail: pts > 0 ? `${pts}-point polygon` : "No footprint found",
+            detail: pts > 0 ? `${pts}-point polygon` : "Not found",
           });
         } catch {
           updateStep(0, { status: "error", detail: "Failed" });
@@ -85,7 +87,7 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
             : 0;
           updateStep(2, {
             status: "done",
-            detail: fields > 0 ? `${fields} fields` : "No data found",
+            detail: fields > 0 ? `${fields} fields` : "No data",
           });
         } catch {
           updateStep(2, { status: "error", detail: "Failed" });
@@ -130,28 +132,49 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
   }, [geocoded]);
 
   return (
-    <div className="w-full max-w-2xl rounded-lg border border-zinc-200 bg-white p-6 dark:border-zinc-800 dark:bg-zinc-900">
-      <h3 className="mb-4 text-sm font-semibold uppercase tracking-wide text-zinc-500">
-        Collecting data for {geocoded.address}
-      </h3>
-      <div className="mb-2 text-xs text-zinc-400">
-        {geocoded.latitude.toFixed(6)}, {geocoded.longitude.toFixed(6)}
-      </div>
-      <ul className="space-y-3">
-        {steps.map((step, i) => (
-          <li key={i} className="flex items-center gap-3 text-sm">
-            <StatusIcon status={step.status} />
-            <span className={step.status === "error" ? "text-red-500" : ""}>
-              {step.label}
-            </span>
-            {step.detail && (
-              <span className="ml-auto text-xs text-zinc-400">
-                {step.detail}
+    <div className="w-full max-w-xl">
+      <div className="rounded-2xl border border-zinc-200 bg-white/80 p-6 shadow-sm backdrop-blur-sm dark:border-zinc-800 dark:bg-zinc-900/80">
+        <div className="mb-4 flex items-center justify-between">
+          <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
+            Collecting data
+          </h3>
+          <span className="text-xs tabular-nums text-zinc-400">
+            {doneCount}/{steps.length}
+          </span>
+        </div>
+
+        {/* Progress bar */}
+        <div className="mb-5 h-1 w-full overflow-hidden rounded-full bg-zinc-100 dark:bg-zinc-800">
+          <div
+            className="h-full rounded-full bg-gradient-to-r from-blue-500 to-violet-500 transition-all duration-500 ease-out"
+            style={{ width: `${progress}%` }}
+          />
+        </div>
+
+        <ul className="space-y-3">
+          {steps.map((step, i) => (
+            <li key={i} className="flex items-center gap-3 text-sm">
+              <StatusIcon status={step.status} />
+              <span
+                className={
+                  step.status === "error"
+                    ? "text-red-500"
+                    : step.status === "done"
+                    ? "text-zinc-900 dark:text-zinc-100"
+                    : "text-zinc-500"
+                }
+              >
+                {step.label}
               </span>
-            )}
-          </li>
-        ))}
-      </ul>
+              {step.detail && (
+                <span className="ml-auto text-xs text-zinc-400">
+                  {step.detail}
+                </span>
+              )}
+            </li>
+          ))}
+        </ul>
+      </div>
     </div>
   );
 }
@@ -159,20 +182,24 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
 function StatusIcon({ status }: { status: StepStatus }) {
   switch (status) {
     case "pending":
-      return <span className="h-4 w-4 rounded-full border-2 border-zinc-300 dark:border-zinc-600" />;
+      return (
+        <span className="h-4 w-4 rounded-full border-2 border-zinc-200 dark:border-zinc-700" />
+      );
     case "loading":
       return (
         <span className="h-4 w-4 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
       );
     case "done":
       return (
-        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-green-500 text-[10px] text-white">
-          &#10003;
+        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-emerald-500 text-white">
+          <svg className="h-2.5 w-2.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={3}>
+            <path strokeLinecap="round" strokeLinejoin="round" d="M5 13l4 4L19 7" />
+          </svg>
         </span>
       );
     case "error":
       return (
-        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] text-white">
+        <span className="flex h-4 w-4 items-center justify-center rounded-full bg-red-500 text-[10px] font-bold text-white">
           !
         </span>
       );

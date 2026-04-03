@@ -7,52 +7,75 @@ interface PropertyInspectorProps {
 }
 
 export default function PropertyInspector({ data }: PropertyInspectorProps) {
-  const { assessor, footprint, elevation_m, streetImages, listingPhotos } = data;
+  const { assessor, footprint, elevation_m, streetImages, listingPhotos, geocoded } = data;
+
+  const sections = [
+    {
+      title: "Location",
+      fields: [
+        { label: "Address", value: geocoded?.address },
+        { label: "Latitude", value: geocoded?.latitude?.toFixed(6) },
+        { label: "Longitude", value: geocoded?.longitude?.toFixed(6) },
+        elevation_m != null ? { label: "Elevation", value: `${elevation_m}m` } : null,
+      ].filter(Boolean) as { label: string; value: string | undefined }[],
+    },
+    {
+      title: "Building",
+      fields: [
+        assessor?.sqft ? { label: "Living Area", value: `${assessor.sqft.toLocaleString()} sqft` } : null,
+        assessor?.lot_sqft ? { label: "Lot Size", value: `${assessor.lot_sqft.toLocaleString()} sqft` } : null,
+        assessor?.bedrooms ? { label: "Bedrooms", value: String(assessor.bedrooms) } : null,
+        assessor?.bathrooms ? { label: "Bathrooms", value: String(assessor.bathrooms) } : null,
+        assessor?.stories ? { label: "Stories", value: String(assessor.stories) } : null,
+        assessor?.year_built ? { label: "Year Built", value: String(assessor.year_built) } : null,
+      ].filter(Boolean) as { label: string; value: string }[],
+    },
+    {
+      title: "Materials",
+      fields: [
+        assessor?.roof_type ? { label: "Roof", value: assessor.roof_type } : null,
+        assessor?.exterior_material ? { label: "Exterior", value: assessor.exterior_material } : null,
+      ].filter(Boolean) as { label: string; value: string }[],
+    },
+    {
+      title: "Collected Data",
+      fields: [
+        footprint ? { label: "Footprint", value: `${footprint.length}-point polygon` } : null,
+        { label: "Street Images", value: String(streetImages.length) },
+        { label: "Listing Photos", value: String(listingPhotos.length) },
+      ].filter(Boolean) as { label: string; value: string }[],
+    },
+  ];
 
   return (
-    <div className="h-48 shrink-0 overflow-y-auto border-t border-zinc-200 bg-white px-4 py-3 dark:border-zinc-800 dark:bg-zinc-950">
-      <h3 className="mb-3 text-xs font-semibold uppercase tracking-wide text-zinc-400">
-        Collected Property Data
-      </h3>
-      <div className="grid grid-cols-2 gap-x-8 gap-y-2 text-sm md:grid-cols-4">
-        {assessor?.sqft && (
-          <Field label="Area" value={`${assessor.sqft.toLocaleString()} sqft`} />
-        )}
-        {assessor?.lot_sqft && (
-          <Field label="Lot" value={`${assessor.lot_sqft.toLocaleString()} sqft`} />
-        )}
-        {assessor?.bedrooms && (
-          <Field label="Bedrooms" value={String(assessor.bedrooms)} />
-        )}
-        {assessor?.bathrooms && (
-          <Field label="Bathrooms" value={String(assessor.bathrooms)} />
-        )}
-        {assessor?.year_built && (
-          <Field label="Year Built" value={String(assessor.year_built)} />
-        )}
-        {assessor?.stories && (
-          <Field label="Stories" value={String(assessor.stories)} />
-        )}
-        {elevation_m != null && (
-          <Field label="Elevation" value={`${elevation_m}m`} />
-        )}
-        {footprint && (
-          <Field label="Footprint" value={`${footprint.length} points`} />
-        )}
-        <Field
-          label="Images"
-          value={`${streetImages.length + listingPhotos.length} total`}
-        />
+    <div className="h-full overflow-y-auto p-6">
+      <div className="mx-auto max-w-2xl space-y-6">
+        {sections.map((section) => {
+          if (section.fields.length === 0) return null;
+          return (
+            <div key={section.title}>
+              <h3 className="mb-3 text-xs font-semibold uppercase tracking-wider text-zinc-400">
+                {section.title}
+              </h3>
+              <div className="rounded-xl border border-zinc-200 bg-white dark:border-zinc-800 dark:bg-zinc-900">
+                {section.fields.map((field, i) => (
+                  <div
+                    key={field.label}
+                    className={`flex items-center justify-between px-4 py-3 ${
+                      i > 0 ? "border-t border-zinc-100 dark:border-zinc-800" : ""
+                    }`}
+                  >
+                    <span className="text-sm text-zinc-500">{field.label}</span>
+                    <span className="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+                      {field.value}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          );
+        })}
       </div>
-    </div>
-  );
-}
-
-function Field({ label, value }: { label: string; value: string }) {
-  return (
-    <div>
-      <div className="text-xs text-zinc-400">{label}</div>
-      <div className="font-medium">{value}</div>
     </div>
   );
 }
