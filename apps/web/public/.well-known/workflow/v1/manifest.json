@@ -1,0 +1,167 @@
+{
+  "version": "1.0.0",
+  "steps": {
+    "node_modules/.pnpm/workflow@4.2.0-beta.76_@nestjs+common@11.1.18_reflect-metadata@0.2.2_rxjs@7.8.2__@nestj_d6af1c0887ca20c391b7fbeb2546bd2d/node_modules/workflow/dist/stdlib.js": {
+      "fetch": {
+        "stepId": "step//workflow@4.2.0-beta.76//fetch"
+      }
+    },
+    "node_modules/.pnpm/workflow@4.2.0-beta.76_@nestjs+common@11.1.18_reflect-metadata@0.2.2_rxjs@7.8.2__@nestj_d6af1c0887ca20c391b7fbeb2546bd2d/node_modules/workflow/dist/internal/builtins.js": {
+      "__builtin_response_array_buffer": {
+        "stepId": "__builtin_response_array_buffer"
+      },
+      "__builtin_response_json": {
+        "stepId": "__builtin_response_json"
+      },
+      "__builtin_response_text": {
+        "stepId": "__builtin_response_text"
+      }
+    },
+    "lib/workflows/steps.ts": {
+      "completeWorkflowRun": {
+        "stepId": "step//./lib/workflows/steps//completeWorkflowRun"
+      },
+      "dispatchWorkflowStep": {
+        "stepId": "step//./lib/workflows/steps//dispatchWorkflowStep"
+      },
+      "registerWorkflowRun": {
+        "stepId": "step//./lib/workflows/steps//registerWorkflowRun"
+      }
+    }
+  },
+  "workflows": {
+    "lib/workflows/property-intake.ts": {
+      "propertyIntakeWorkflow": {
+        "workflowId": "workflow//./lib/workflows/property-intake//propertyIntakeWorkflow",
+        "graph": {
+          "nodes": [
+            {
+              "id": "start",
+              "type": "workflowStart",
+              "data": {
+                "label": "Start: propertyIntakeWorkflow",
+                "nodeKind": "workflow_start"
+              }
+            },
+            {
+              "id": "end",
+              "type": "workflowEnd",
+              "data": {
+                "label": "Return",
+                "nodeKind": "workflow_end"
+              }
+            }
+          ],
+          "edges": [
+            {
+              "id": "e_start_end",
+              "source": "start",
+              "target": "end",
+              "type": "default"
+            }
+          ]
+        }
+      }
+    },
+    "lib/workflows/artifact-regen.ts": {
+      "artifactRegenWorkflow": {
+        "workflowId": "workflow//./lib/workflows/artifact-regen//artifactRegenWorkflow",
+        "graph": {
+          "nodes": [
+            {
+              "id": "start",
+              "type": "workflowStart",
+              "data": {
+                "label": "Start: artifactRegenWorkflow",
+                "nodeKind": "workflow_start"
+              }
+            },
+            {
+              "id": "end",
+              "type": "workflowEnd",
+              "data": {
+                "label": "Return",
+                "nodeKind": "workflow_end"
+              }
+            }
+          ],
+          "edges": [
+            {
+              "id": "e_start_end",
+              "source": "start",
+              "target": "end",
+              "type": "default"
+            }
+          ]
+        }
+      }
+    },
+    "lib/workflows/design-patch.ts": {
+      "designPatchWorkflow": {
+        "workflowId": "workflow//./lib/workflows/design-patch//designPatchWorkflow",
+        "graph": {
+          "nodes": [
+            {
+              "id": "start",
+              "type": "workflowStart",
+              "data": {
+                "label": "Start: designPatchWorkflow",
+                "nodeKind": "workflow_start"
+              }
+            },
+            {
+              "id": "end",
+              "type": "workflowEnd",
+              "data": {
+                "label": "Return",
+                "nodeKind": "workflow_end"
+              }
+            }
+          ],
+          "edges": [
+            {
+              "id": "e_start_end",
+              "source": "start",
+              "target": "end",
+              "type": "default"
+            }
+          ]
+        }
+      }
+    },
+    "lib/workflows/building-scaffold.ts": {
+      "buildingScaffoldWorkflow": {
+        "workflowId": "workflow//./lib/workflows/building-scaffold//buildingScaffoldWorkflow",
+        "graph": {
+          "nodes": [
+            {
+              "id": "start",
+              "type": "workflowStart",
+              "data": {
+                "label": "Start: buildingScaffoldWorkflow",
+                "nodeKind": "workflow_start"
+              }
+            },
+            {
+              "id": "end",
+              "type": "workflowEnd",
+              "data": {
+                "label": "Return",
+                "nodeKind": "workflow_end"
+              }
+            }
+          ],
+          "edges": [
+            {
+              "id": "e_start_end",
+              "source": "start",
+              "target": "end",
+              "type": "default"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "classes": {}
+}

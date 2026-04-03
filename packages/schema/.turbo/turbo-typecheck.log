@@ -1,0 +1,4 @@
+
+> @vitruvius/schema@0.1.0 typecheck /Users/genevievefox/Documents/Nic/vitruvius/packages/schema
+> tsc -p tsconfig.json --noEmit
+
