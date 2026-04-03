@@ -1,4 +1,0 @@
-
-> @vitruvius/contracts@0.1.0 typecheck /Users/genevievefox/Documents/Nic/vitruvius/packages/contracts
-> tsc -p tsconfig.json --noEmit
-
