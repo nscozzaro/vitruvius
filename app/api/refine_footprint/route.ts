@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { callVisionLLM } from "@/app/lib/llm";
 
 /**
  * POST /api/refine_footprint
@@ -64,11 +64,10 @@ export async function POST(request: NextRequest) {
     const body = await request.json();
     const { footprint, parcelBoundary, origin, geocoded, context, iteration = 0 } = body;
 
-    const apiKey = process.env.GOOGLE_GEMINI_API_KEY || process.env.GOOGLE_STREET_VIEW_API_KEY;
     const mapsKey = process.env.GOOGLE_STREET_VIEW_API_KEY;
 
-    if (!apiKey || !mapsKey || !geocoded) {
-      return NextResponse.json({ error: "Missing API key or geocoded data" }, { status: 400 });
+    if (!mapsKey || !geocoded) {
+      return NextResponse.json({ error: "Missing Maps API key or geocoded data" }, { status: 400 });
     }
 
     const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
@@ -89,12 +88,6 @@ export async function POST(request: NextRequest) {
 
     const imgBuffer = await imgResp.arrayBuffer();
     const base64 = Buffer.from(imgBuffer).toString("base64");
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: "gemini-3-flash-preview",
-      systemInstruction: VISION_PROMPT,
-    });
 
     const prompt = `Iteration ${iteration + 1}. Satellite image centered at ${geocoded.latitude}, ${geocoded.longitude} for ${geocoded.address || "the property"}.
 
@@ -117,12 +110,13 @@ INSTRUCTIONS:
 
 Return the corrected polygons as JSON.`;
 
-    const result = await model.generateContent([
-      { inlineData: { data: base64, mimeType: "image/png" } },
-      { text: prompt },
-    ]);
-
-    let responseText = result.response.text();
+    let responseText = await callVisionLLM(
+      VISION_PROMPT,
+      base64,
+      "image/png",
+      prompt,
+      { maxTokens: 2048 }
+    );
     responseText = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
 
     let parsed;
