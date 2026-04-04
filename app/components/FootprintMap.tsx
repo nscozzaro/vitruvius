@@ -35,7 +35,8 @@ export default function FootprintMap({
     lon: originLon + pt.x / (111320 * cosDeg(originLat)),
   });
 
-  const points = footprint.map(toLatLon);
+  const points = footprint.filter(p => p && typeof p.x === "number").map(toLatLon);
+  if (points.length < 3) return null;
   const closedPoints = [...points, points[0]];
 
   // Build Google Static Maps URL with footprint overlay

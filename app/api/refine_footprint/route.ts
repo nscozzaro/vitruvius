@@ -4,216 +4,166 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 /**
  * POST /api/refine_footprint
  *
- * Two-pass calibration strategy:
+ * Iterative point-by-point calibration:
  *
- * Pass 1 (Geometric): Cross-reference OSM footprint, municipal parcel, and geocoded point.
- *   - The geocoded point (Nominatim) is typically the most accurate single point (address centroid).
- *   - OSM building footprints have ~1-3m accuracy but consistent relative shape.
- *   - Municipal GIS parcel boundaries can have 2-5m systematic offsets from different datums.
- *   - Strategy: Use the footprint centroid-to-geocode offset as a correction hint.
+ * 1. Sends a CLEAN satellite image to Gemini vision
+ * 2. AI identifies the actual roof polygon and property boundary
+ * 3. AI returns ADJUSTED lat/lon coordinates for each point
+ * 4. Repeats if confidence is low (up to 2 iterations)
  *
- * Pass 2 (Vision): Send a CLEAN satellite image (no overlays) to Gemini vision.
- *   - AI identifies the roof outline and property boundaries visible in the image.
- *   - Compares against the coordinate data to suggest fine-grained adjustments.
- *   - Returns pixel-level observations about misalignment direction.
+ * Key insight: Municipal GIS parcel boundaries go to street centerline,
+ * but site plans need the actual lot edge (sidewalk/fence). The AI
+ * must distinguish between the legal lot line and the usable property edge.
  */
 
-const VISION_PROMPT = `You are a precision geospatial calibration AI. You are analyzing a high-resolution satellite image of a residential property.
+const VISION_PROMPT = `You are a precision geospatial calibration AI specializing in residential property mapping.
 
-I will provide you with:
-1. A CLEAN satellite image (no overlays) of the property at zoom level 20
-2. The building footprint coordinates (as lat/lon polygon)
-3. The parcel/lot boundary coordinates (as lat/lon polygon)
-4. The geocoded address point (lat/lon)
-5. Title report data if available (legal description, easements, lot dimensions)
+You will receive:
+1. A high-resolution satellite image of a residential property
+2. The current building footprint as a lat/lon polygon
+3. The current parcel boundary as a lat/lon polygon
+4. The geocoded address point
+5. Legal context from the title report (easements, lot description)
 
-YOUR TASK: Determine how to shift the footprint and parcel polygons to better align with what's visible in the satellite image.
+YOUR TASK: Return CORRECTED coordinates for both polygons.
 
-METHODOLOGY:
-- Identify the actual roof outline in the satellite image
-- Identify property boundaries (fences, hedges, pavement edges, walls)
-- Compare the centroid of the provided footprint polygon with the centroid of the visible roof
-- Compare the parcel polygon edges with visible boundary features
-- Estimate the offset in meters (north/south and east/west) needed to correct each
+FOR THE BUILDING FOOTPRINT:
+- Trace the ACTUAL ROOF OUTLINE visible in the satellite image
+- Return new lat/lon coordinates for each vertex of the roof
+- The roof is the ground truth — adjust all points to match what you see
+- If the current polygon has roughly the right number of points, adjust each one
+- If the shape is fundamentally wrong, return a new set of points that traces the roof
 
-IMPORTANT CALIBRATION NOTES:
-- Positive X = east, negative X = west
-- Positive Y = north, negative Y = south
-- For parcel offset: positive lat = north, positive lon = east
-- Typical municipal GIS offset is 2-5 meters in one direction
-- OSM data is typically accurate to 1-2 meters
-- If you can see the roof clearly, use its edges as the primary reference for the footprint
-- If you can see fences/hedges, use them as reference for the parcel boundary
+FOR THE PARCEL BOUNDARY:
+- IMPORTANT: Municipal GIS data often extends to the street centerline, but the ACTUAL usable lot boundary is at the sidewalk/fence/curb edge
+- Identify the real property boundary from visual features: fences, hedges, sidewalk edges, driveway edges, changes in landscaping
+- The EASTERN boundary (toward the cul-de-sac) should be at the edge of the private property, NOT the center of the street
+- The WESTERN boundary should be at the edge of the lot, NOT in the middle of the parking area
+- Return corrected lat/lon coordinates that represent the actual buildable lot
 
-Return ONLY valid JSON (no markdown fences):
+COORDINATE FORMAT: Return lat/lon with 7 decimal places.
+
+Return ONLY valid JSON (no markdown):
 {
-  "footprintOffset": { "x": 0.0, "y": 0.0 },
-  "parcelOffset": { "lat": 0.0, "lon": 0.0 },
-  "confidence": 0.7,
-  "notes": "Explanation of what you see and why these offsets are recommended",
-  "roofDescription": "Description of the building shape visible in the satellite image",
-  "boundaryDescription": "Description of visible property boundaries"
+  "adjustedFootprint": [
+    {"lat": 34.1234567, "lon": -119.1234567},
+    ...
+  ],
+  "adjustedParcel": [
+    {"lat": 34.1234567, "lon": -119.1234567},
+    ...
+  ],
+  "confidence": 0.85,
+  "notes": "Description of changes made",
+  "roofDescription": "What the roof looks like",
+  "boundaryDescription": "What boundaries are visible"
 }`;
 
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { footprint, parcelBoundary, origin, geocoded, context } = body;
+    const { footprint, parcelBoundary, origin, geocoded, context, iteration = 0 } = body;
 
     const apiKey = process.env.GOOGLE_GEMINI_API_KEY || process.env.GOOGLE_STREET_VIEW_API_KEY;
     const mapsKey = process.env.GOOGLE_STREET_VIEW_API_KEY;
 
-    if (!apiKey) {
-      return NextResponse.json({ error: "No API key" }, { status: 500 });
+    if (!apiKey || !mapsKey || !geocoded) {
+      return NextResponse.json({ error: "Missing API key or geocoded data" }, { status: 400 });
     }
 
-    // ── Pass 1: Geometric calibration ───────────────────────────────
     const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
-    let geoOffset = { x: 0, y: 0 };
-    let parcelGeoOffset = { lat: 0, lon: 0 };
 
-    if (footprint && origin && geocoded) {
-      // Calculate footprint centroid in lat/lon
-      const fpLatLon = footprint.map((p: { x: number; y: number }) => ({
-        lat: origin.latitude + p.y / 110540,
-        lon: origin.longitude + p.x / (111320 * cosDeg(origin.latitude)),
+    // Convert footprint x/y to lat/lon
+    const fpLatLon = (footprint || []).map((p: { x: number; y: number }) => ({
+      lat: Number((origin.latitude + p.y / 110540).toFixed(7)),
+      lon: Number((origin.longitude + p.x / (111320 * cosDeg(origin.latitude))).toFixed(7)),
+    }));
+
+    // Fetch CLEAN satellite image (no overlays)
+    const cleanUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${geocoded.latitude},${geocoded.longitude}&zoom=20&size=800x600&scale=2&maptype=satellite&key=${mapsKey}`;
+
+    const imgResp = await fetch(cleanUrl);
+    if (!imgResp.ok) {
+      return NextResponse.json({ error: "Failed to fetch satellite image" }, { status: 500 });
+    }
+
+    const imgBuffer = await imgResp.arrayBuffer();
+    const base64 = Buffer.from(imgBuffer).toString("base64");
+
+    const genAI = new GoogleGenerativeAI(apiKey);
+    const model = genAI.getGenerativeModel({
+      model: "gemini-3-flash-preview",
+      systemInstruction: VISION_PROMPT,
+    });
+
+    const prompt = `Iteration ${iteration + 1}. Satellite image centered at ${geocoded.latitude}, ${geocoded.longitude} for ${geocoded.address || "the property"}.
+
+CURRENT BUILDING FOOTPRINT (${fpLatLon.length} points, lat/lon):
+${JSON.stringify(fpLatLon, null, 1)}
+
+CURRENT PARCEL BOUNDARY (${parcelBoundary?.length || 0} points, lat/lon):
+${JSON.stringify(parcelBoundary || [], null, 1)}
+
+LEGAL CONTEXT:
+${context || "No title report data available."}
+
+INSTRUCTIONS:
+1. Look at the satellite image carefully
+2. Identify the actual roof outline of the building at this address
+3. Identify the actual property boundaries (fences, hedges, sidewalk edges — NOT the street centerline)
+4. Return adjusted coordinates for BOTH polygons that match what you see
+5. For the parcel: pull the eastern boundary back from the street centerline to the sidewalk/curb edge
+6. For the footprint: adjust each point to match the visible roof edge
+
+Return the corrected polygons as JSON.`;
+
+    const result = await model.generateContent([
+      { inlineData: { data: base64, mimeType: "image/png" } },
+      { text: prompt },
+    ]);
+
+    let responseText = result.response.text();
+    responseText = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
+
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch {
+      return NextResponse.json({
+        error: "Failed to parse AI response",
+        raw: responseText.slice(0, 500),
+      });
+    }
+
+    const adjustedFp = parsed.adjustedFootprint || [];
+    const adjustedParcel = parsed.adjustedParcel || [];
+    const confidence = parsed.confidence || 0.5;
+
+    // Convert adjusted footprint back to x/y relative to origin
+    const refOrigin = origin || geocoded;
+    const newFootprint = adjustedFp
+      .filter((p: { lat?: number; lon?: number }) => p && typeof p.lat === "number" && typeof p.lon === "number")
+      .map((p: { lat: number; lon: number }) => ({
+        x: Math.round((p.lon - refOrigin.longitude) * 111320 * cosDeg(refOrigin.latitude) * 1000) / 1000,
+        y: Math.round((p.lat - refOrigin.latitude) * 110540 * 1000) / 1000,
       }));
-      const fpCLat = fpLatLon.reduce((s: number, p: { lat: number }) => s + p.lat, 0) / fpLatLon.length;
-      const fpCLon = fpLatLon.reduce((s: number, p: { lon: number }) => s + p.lon, 0) / fpLatLon.length;
 
-      // Geocoded point should be near the building center
-      // Small offset is expected (1-2m), large offset suggests data misalignment
-      const fpToGeoY = (geocoded.latitude - fpCLat) * 110540;
-      const fpToGeoX = (geocoded.longitude - fpCLon) * 111320 * cosDeg(geocoded.latitude);
-
-      // Only apply geometric correction if offset > 2m (significant)
-      if (Math.abs(fpToGeoX) > 2 || Math.abs(fpToGeoY) > 2) {
-        // Apply half the correction (conservative — don't overshoot)
-        geoOffset = { x: fpToGeoX * 0.5, y: fpToGeoY * 0.5 };
-      }
-
-      // For parcel: check if parcel center is significantly offset from geocoded point
-      if (parcelBoundary && parcelBoundary.length > 2) {
-        const pCLat = parcelBoundary.reduce((s: number, p: { lat: number }) => s + p.lat, 0) / parcelBoundary.length;
-        const pCLon = parcelBoundary.reduce((s: number, p: { lon: number }) => s + p.lon, 0) / parcelBoundary.length;
-
-        // If parcel center is >3m from geocoded point, apply partial correction
-        const pToGeoLat = geocoded.latitude - pCLat;
-        const pToGeoLon = geocoded.longitude - pCLon;
-        const pOffsetM = Math.sqrt(
-          Math.pow(pToGeoLat * 110540, 2) +
-          Math.pow(pToGeoLon * 111320 * cosDeg(geocoded.latitude), 2)
-        );
-
-        if (pOffsetM > 3) {
-          // Apply partial correction toward the geocoded point
-          parcelGeoOffset = {
-            lat: pToGeoLat * 0.3,
-            lon: pToGeoLon * 0.3,
-          };
-        }
-      }
-    }
-
-    // ── Pass 2: AI Vision calibration ───────────────────────────────
-    let visionOffset = { footprint: { x: 0, y: 0 }, parcel: { lat: 0, lon: 0 } };
-    let notes = "";
-    let roofDesc = "";
-    let boundaryDesc = "";
-    let confidence = 0.5;
-
-    if (mapsKey && geocoded) {
-      try {
-        // Fetch a CLEAN satellite image (no overlays)
-        const cleanUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${geocoded.latitude},${geocoded.longitude}&zoom=20&size=600x400&scale=2&maptype=satellite&key=${mapsKey}`;
-
-        const imgResp = await fetch(cleanUrl);
-        if (imgResp.ok) {
-          const imgBuffer = await imgResp.arrayBuffer();
-          const base64 = Buffer.from(imgBuffer).toString("base64");
-
-          const genAI = new GoogleGenerativeAI(apiKey);
-          const model = genAI.getGenerativeModel({
-            model: "gemini-3-flash-preview",
-            systemInstruction: VISION_PROMPT,
-          });
-
-          // Build lat/lon footprint for the AI
-          const fpLatLon = footprint?.map((p: { x: number; y: number }) => ({
-            lat: (origin.latitude + p.y / 110540).toFixed(7),
-            lon: (origin.longitude + p.x / (111320 * cosDeg(origin.latitude))).toFixed(7),
-          }));
-
-          const prompt = `Satellite image is centered at ${geocoded.latitude.toFixed(7)}, ${geocoded.longitude.toFixed(7)} (the geocoded address point for ${geocoded.address || "the property"}).
-
-Building footprint polygon (lat/lon): ${JSON.stringify(fpLatLon)}
-Parcel boundary polygon (lat/lon): ${JSON.stringify(parcelBoundary?.slice(0, 20))}
-
-Geometric pre-analysis suggests the footprint should shift ${geoOffset.x.toFixed(1)}m east, ${geoOffset.y.toFixed(1)}m north.
-Parcel pre-analysis suggests shifting ${(parcelGeoOffset.lat * 110540).toFixed(1)}m north, ${(parcelGeoOffset.lon * 111320 * cosDeg(geocoded.latitude)).toFixed(1)}m east.
-
-${context ? `Title/legal context:\n${context}` : ""}
-
-Analyze the satellite image and suggest the optimal meter-level offsets to align the building footprint with the visible roof, and the parcel with visible property boundaries.`;
-
-          const result = await model.generateContent([
-            { inlineData: { data: base64, mimeType: "image/png" } },
-            { text: prompt },
-          ]);
-
-          let responseText = result.response.text();
-          responseText = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
-
-          try {
-            const parsed = JSON.parse(responseText);
-            visionOffset = {
-              footprint: parsed.footprintOffset || { x: 0, y: 0 },
-              parcel: parsed.parcelOffset || { lat: 0, lon: 0 },
-            };
-            notes = parsed.notes || "";
-            roofDesc = parsed.roofDescription || "";
-            boundaryDesc = parsed.boundaryDescription || "";
-            confidence = parsed.confidence || 0.5;
-          } catch {
-            notes = "Vision analysis returned non-JSON: " + responseText.slice(0, 200);
-          }
-        }
-      } catch (err) {
-        console.warn("Vision calibration failed:", err);
-        notes = "Vision calibration unavailable. Using geometric calibration only.";
-      }
-    }
-
-    // ── Combine offsets ─────────────────────────────────────────────
-    // Weight: geometric 40%, vision 60% (vision sees the actual image)
-    const finalFootprintOffset = {
-      x: geoOffset.x * 0.4 + visionOffset.footprint.x * 0.6,
-      y: geoOffset.y * 0.4 + visionOffset.footprint.y * 0.6,
-    };
-
-    const finalParcelOffset = {
-      lat: parcelGeoOffset.lat * 0.4 + visionOffset.parcel.lat * 0.6,
-      lon: parcelGeoOffset.lon * 0.4 + visionOffset.parcel.lon * 0.6,
-    };
+    // If confidence < 0.7 and this is the first iteration, run again
+    const shouldIterate = confidence < 0.7 && iteration < 1;
 
     return NextResponse.json({
-      footprintOffset: {
-        x: Math.round(finalFootprintOffset.x * 10) / 10,
-        y: Math.round(finalFootprintOffset.y * 10) / 10,
-      },
-      parcelOffset: {
-        lat: Math.round(finalParcelOffset.lat * 10000000) / 10000000,
-        lon: Math.round(finalParcelOffset.lon * 10000000) / 10000000,
-      },
+      footprint: newFootprint.length >= 3 ? newFootprint : null,
+      parcelBoundary: adjustedParcel.length >= 3 ? adjustedParcel : null,
       confidence,
-      notes,
-      roofDescription: roofDesc,
-      boundaryDescription: boundaryDesc,
-      geometric: { footprint: geoOffset, parcel: parcelGeoOffset },
-      vision: visionOffset,
+      notes: parsed.notes || "",
+      roofDescription: parsed.roofDescription || "",
+      boundaryDescription: parsed.boundaryDescription || "",
+      shouldIterate,
+      iteration: iteration + 1,
     });
   } catch (error) {
     console.error("Refinement error:", error);
-    return NextResponse.json({ error: "Refinement failed" }, { status: 500 });
+    const msg = error instanceof Error ? error.message : "Unknown error";
+    return NextResponse.json({ error: msg }, { status: 500 });
   }
 }

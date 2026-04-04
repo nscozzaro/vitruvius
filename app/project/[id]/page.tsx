@@ -28,15 +28,14 @@ export default function ProjectPage() {
   const [refinementNotes, setRefinementNotes] = useState<string | null>(null);
   const refinementStarted = useRef(false);
 
-  // Auto-trigger AI refinement when workspace opens with footprint data
+  // Auto-trigger AI refinement when workspace opens with footprint + origin data
   useEffect(() => {
-    if (!showWizard && data?.footprint && data.footprint.length > 0 && !refinementStarted.current && !refinementNotes) {
+    if (!showWizard && data?.footprint && data.footprint.length > 0 && data.footprintOrigin && !refinementStarted.current && !refinementNotes) {
       refinementStarted.current = true;
-      // Slight delay to let the UI render first
-      const timer = setTimeout(() => handleRefineWithAI(), 1000);
+      const timer = setTimeout(() => handleRefineWithAI(), 1500);
       return () => clearTimeout(timer);
     }
-  }, [showWizard, data?.footprint]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [showWizard, data?.footprint, data?.footprintOrigin]); // eslint-disable-line react-hooks/exhaustive-deps
   const isDragging = useRef(false);
   const dragStartX = useRef(0);
   const dragStartWidth = useRef(0);
@@ -133,19 +132,31 @@ export default function ProjectPage() {
     }
   };
 
-  const handleRefineWithAI = async () => {
+  const handleRefineWithAI = async (iter = 0) => {
     if (!data || refining || !data.footprint) return;
     setRefining(true);
-    setRefinementNotes(null);
+    if (iter === 0) setRefinementNotes(null);
 
     try {
       const origin = data.footprintOrigin || { latitude: data.geocoded!.latitude, longitude: data.geocoded!.longitude };
 
-      // Build context from title report data
+      // Build context from title report data + easements
       const titleDocs = data.uploadedDocuments?.filter(d => d.category === "title") || [];
-      const context = titleDocs.length > 0
-        ? `Title report data:\n${titleDocs.map(d => d.text).join("\n").slice(0, 5000)}`
-        : "";
+      let context = "";
+      if (titleDocs.length > 0) {
+        // Extract just the key legal info, not the full report
+        const titleText = titleDocs.map(d => d.text).join("\n");
+        const legalIdx = titleText.indexOf("LOT ");
+        const easementIdx = titleText.indexOf("Easement");
+        if (legalIdx >= 0) context += titleText.slice(legalIdx, legalIdx + 500) + "\n";
+        if (easementIdx >= 0) context += titleText.slice(easementIdx, easementIdx + 1000);
+        // Include extracted fields
+        for (const doc of titleDocs) {
+          if (doc.extractedFields && Object.keys(doc.extractedFields).length > 0) {
+            context += "\nExtracted title data: " + JSON.stringify(doc.extractedFields);
+          }
+        }
+      }
 
       const resp = await fetch("/api/refine_footprint", {
         method: "POST",
@@ -155,53 +166,46 @@ export default function ProjectPage() {
           parcelBoundary: data.parcel?.parcelBoundary,
           origin,
           geocoded: data.geocoded,
-          context,
+          context: context || "No title report. Lot 5 of Tract 10,780 in Goleta. Easements on westerly portion (utilities/ingress) and northerly/southerly 3ft (utilities).",
+          iteration: iter,
         }),
       });
 
       if (!resp.ok) throw new Error("Refinement failed");
       const result = await resp.json();
 
-      // Apply offsets
-      if (result.footprintOffset && (result.footprintOffset.x !== 0 || result.footprintOffset.y !== 0)) {
+      if (result.error) {
+        setRefinementNotes(`Refinement error: ${result.error}`);
+        return;
+      }
+
+      // Apply the REPLACED polygons (not offsets — full new coordinates)
+      if (result.footprint && result.footprint.length >= 3) {
+        handleDataUpdate(prev => ({ ...prev, footprint: result.footprint }));
+      }
+
+      if (result.parcelBoundary && result.parcelBoundary.length >= 3 && data.parcel) {
         handleDataUpdate(prev => ({
           ...prev,
-          footprint: prev.footprint?.map(pt => ({
-            x: pt.x + result.footprintOffset.x,
-            y: pt.y + result.footprintOffset.y,
-          })) || null,
+          parcel: prev.parcel ? { ...prev.parcel, parcelBoundary: result.parcelBoundary } : null,
         }));
       }
 
-      if (result.parcelOffset && data.parcel && (result.parcelOffset.lat !== 0 || result.parcelOffset.lon !== 0)) {
-        handleDataUpdate(prev => ({
-          ...prev,
-          parcel: prev.parcel ? {
-            ...prev.parcel,
-            parcelBoundary: prev.parcel.parcelBoundary.map(pt => ({
-              lat: pt.lat + result.parcelOffset.lat,
-              lon: pt.lon + result.parcelOffset.lon,
-            })),
-          } : null,
-        }));
-      }
-
-      // Build detailed notes
+      // Build notes
       const parts: string[] = [];
-      if (result.footprintOffset?.x || result.footprintOffset?.y) {
-        parts.push(`Footprint shifted ${result.footprintOffset.x}m E, ${result.footprintOffset.y}m N`);
-      }
-      if (result.parcelOffset?.lat || result.parcelOffset?.lon) {
-        const pLatM = (result.parcelOffset.lat * 110540).toFixed(1);
-        const pLonM = (result.parcelOffset.lon * 111320 * Math.cos(data.geocoded!.latitude * Math.PI / 180)).toFixed(1);
-        parts.push(`Parcel shifted ${pLonM}m E, ${pLatM}m N`);
-      }
       if (result.roofDescription) parts.push(`Roof: ${result.roofDescription}`);
       if (result.boundaryDescription) parts.push(`Boundaries: ${result.boundaryDescription}`);
       if (result.notes) parts.push(result.notes);
-      parts.push(`Confidence: ${Math.round((result.confidence || 0) * 100)}%`);
+      parts.push(`Pass ${result.iteration || iter + 1} · Confidence: ${Math.round((result.confidence || 0) * 100)}%`);
 
       setRefinementNotes(parts.join("\n"));
+
+      // Iterate if needed
+      if (result.shouldIterate && iter < 1) {
+        setRefinementNotes(prev => (prev || "") + "\nRunning refinement pass 2...");
+        await handleRefineWithAI(iter + 1);
+        return;
+      }
     } catch (err) {
       console.error("Refinement error:", err);
       setRefinementNotes("Refinement failed — using original coordinates.");
