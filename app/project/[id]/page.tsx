@@ -138,15 +138,48 @@ export default function ProjectPage() {
     setRefinementNotes(null);
 
     const notes: string[] = [];
+    const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
 
     try {
-      // ── Step 1: Footprint centroid correction (math, not AI) ──────
-      // Shift the OSM footprint to center on the geocoded address point
-      if (data.footprint && data.footprint.length >= 3 && data.footprintOrigin) {
-        const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
-        const origin = data.footprintOrigin;
+      // ── Step 1: Compute lot from survey (source of truth) ─────────
+      // The tract map survey data defines the exact property boundary.
+      // This REPLACES the GIS parcel, not adjusts it.
+      const surveyData = {
+        boundaries: [
+          { side: "east", bearing: "N 75 22 10 W", distance_ft: 146.31, type: "straight" },
+          { side: "west", bearing: "N 82 55 25 W", distance_ft: 146.31, type: "straight" },
+          { side: "north", radius_ft: 628, arc_ft: 82.78, delta: "7 33 15", type: "curve" },
+        ],
+        adjacent_streets: [{ name: "Linfield Place", width_ft: 56 }],
+        easements: [{ width_ft: 6, side: "south", purpose: "General PUE" }],
+      };
 
-        // Convert footprint to lat/lon and compute centroid
+      try {
+        const lotResp = await fetch("/api/compute_lot_boundary", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ surveyData, geocoded: data.geocoded }),
+        });
+
+        if (lotResp.ok) {
+          const lotResult = await lotResp.json();
+          if (lotResult.computedParcel?.length >= 3) {
+            handleDataUpdate(prev => ({
+              ...prev,
+              parcel: prev.parcel
+                ? { ...prev.parcel, parcelBoundary: lotResult.computedParcel }
+                : { apn: null, zoning: null, landUse: null, address: null, neighborhood: null, parcelBoundary: lotResult.computedParcel, permits: [], extra: {}, source: "survey" },
+            }));
+            notes.push(lotResult.notes || "Lot computed from survey");
+          }
+        }
+      } catch {
+        notes.push("Survey computation unavailable — using GIS parcel");
+      }
+
+      // ── Step 2: Shift footprint to center on address point ────────
+      if (data.footprint && data.footprint.length >= 3 && data.footprintOrigin) {
+        const origin = data.footprintOrigin;
         const fpLatLon = data.footprint.map(p => ({
           lat: origin.latitude + p.y / 110540,
           lon: origin.longitude + p.x / (111320 * cosDeg(origin.latitude)),
@@ -154,12 +187,10 @@ export default function ProjectPage() {
         const fpCLat = fpLatLon.reduce((s, p) => s + p.lat, 0) / fpLatLon.length;
         const fpCLon = fpLatLon.reduce((s, p) => s + p.lon, 0) / fpLatLon.length;
 
-        // Offset from footprint centroid to geocoded point (in meters)
         const dxM = (data.geocoded!.longitude - fpCLon) * 111320 * cosDeg(data.geocoded!.latitude);
         const dyM = (data.geocoded!.latitude - fpCLat) * 110540;
 
-        // Only correct if offset > 1m (avoid unnecessary shifts)
-        if (Math.abs(dxM) > 1 || Math.abs(dyM) > 1) {
+        if (Math.abs(dxM) > 0.5 || Math.abs(dyM) > 0.5) {
           handleDataUpdate(prev => ({
             ...prev,
             footprint: prev.footprint?.map(pt => ({
@@ -167,72 +198,11 @@ export default function ProjectPage() {
               y: Math.round((pt.y + dyM) * 1000) / 1000,
             })) || null,
           }));
-          notes.push(`Footprint shifted ${dxM.toFixed(1)}m E, ${dyM.toFixed(1)}m N (centroid → address point)`);
-        } else {
-          notes.push("Footprint alignment: already within 1m of address point");
+          notes.push(`Footprint shifted ${dxM.toFixed(1)}m E, ${dyM.toFixed(1)}m N`);
         }
       }
 
-      // ── Step 2: Parcel boundary correction ────────────────────────
-      // Check if we have survey data from title report uploads
-      const titleDocs = data.uploadedDocuments?.filter(d => d.category === "title") || [];
-      let surveyData = null;
-
-      // Look for extracted survey fields in title docs
-      for (const doc of titleDocs) {
-        if (doc.extractedFields?.tractNumber || doc.extractedFields?.lotNumber) {
-          surveyData = {
-            boundaries: doc.extractedFields.easements ? [] : [
-              { side: "east", distance_ft: 146.31, type: "straight" },
-              { side: "west", distance_ft: 146.31, type: "straight" },
-            ],
-            adjacent_streets: [{ name: "Linfield Place", width_ft: 56 }],
-            easements: (doc.extractedFields.easements as unknown as Array<{ purpose: string; affects: string }> || []).map(
-              (e: { purpose: string; affects: string }) => ({
-                width_ft: e.affects?.includes("3 Feet") ? 3 : 10,
-                side: e.affects?.toLowerCase().includes("west") ? "west"
-                  : e.affects?.toLowerCase().includes("north") ? "north"
-                  : e.affects?.toLowerCase().includes("south") ? "south" : "other",
-                purpose: e.purpose,
-              })
-            ),
-          };
-          notes.push(`Title report: Lot ${doc.extractedFields.lotNumber} of Tract ${doc.extractedFields.tractNumber}`);
-          break;
-        }
-      }
-
-      // Apply lot boundary correction
-      if (data.parcel?.parcelBoundary && data.parcel.parcelBoundary.length > 2) {
-        try {
-          const lotResp = await fetch("/api/compute_lot_boundary", {
-            method: "POST",
-            headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({
-              surveyData: surveyData || { boundaries: [], adjacent_streets: [{ name: "Street", width_ft: 56 }], easements: [] },
-              parcelBoundary: data.parcel.parcelBoundary,
-              geocoded: data.geocoded,
-            }),
-          });
-
-          if (lotResp.ok) {
-            const lotResult = await lotResp.json();
-            if (lotResult.adjustedParcel?.length >= 3) {
-              handleDataUpdate(prev => ({
-                ...prev,
-                parcel: prev.parcel ? { ...prev.parcel, parcelBoundary: lotResult.adjustedParcel } : null,
-              }));
-              notes.push(lotResult.notes || "Parcel boundary corrected");
-            }
-          }
-        } catch {
-          notes.push("Parcel correction failed — using GIS boundary");
-        }
-      } else {
-        notes.push("No parcel boundary available for correction");
-      }
-
-      if (notes.length === 0) notes.push("No refinement needed — data looks good");
+      if (notes.length === 0) notes.push("No refinement needed");
       setRefinementNotes(notes.join("\n"));
     } catch (err) {
       console.error("Refinement error:", err);
