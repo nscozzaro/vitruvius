@@ -3,23 +3,33 @@
 import { useState } from "react";
 import type { CollectedImage } from "@/app/lib/api";
 
+type FilterType = "all" | "satellite" | "street" | "listing";
+
 interface ImageGalleryProps {
   streetImages: CollectedImage[];
   listingPhotos: CollectedImage[];
+  satelliteImages?: CollectedImage[];
 }
 
-export default function ImageGallery({ streetImages, listingPhotos }: ImageGalleryProps) {
-  const [filter, setFilter] = useState<"all" | "street" | "listing">("all");
+export default function ImageGallery({
+  streetImages,
+  listingPhotos,
+  satelliteImages = [],
+}: ImageGalleryProps) {
+  const [filter, setFilter] = useState<FilterType>("all");
   const [selectedImage, setSelectedImage] = useState<CollectedImage | null>(null);
 
+  const allImages = [...satelliteImages, ...streetImages, ...listingPhotos];
   const images =
-    filter === "street"
+    filter === "satellite"
+      ? satelliteImages
+      : filter === "street"
       ? streetImages
       : filter === "listing"
       ? listingPhotos
-      : [...streetImages, ...listingPhotos];
+      : allImages;
 
-  if (images.length === 0 && streetImages.length === 0 && listingPhotos.length === 0) {
+  if (allImages.length === 0) {
     return (
       <div className="flex h-full items-center justify-center text-zinc-400">
         <div className="text-center">
@@ -32,17 +42,35 @@ export default function ImageGallery({ streetImages, listingPhotos }: ImageGalle
     );
   }
 
+  const filters: { id: FilterType; label: string; count: number }[] = [
+    { id: "all", label: "All", count: allImages.length },
+    { id: "satellite", label: "Satellite", count: satelliteImages.length },
+    { id: "street", label: "Street View", count: streetImages.length },
+    { id: "listing", label: "Listing", count: listingPhotos.length },
+  ];
+
+  const sourceLabel = (source: string) => {
+    switch (source) {
+      case "google_street_view":
+        return "Google Street View";
+      case "google_street_view_detail":
+        return "Street View Detail";
+      case "google_satellite":
+        return "Satellite";
+      case "mapillary":
+        return "Mapillary";
+      case "wikimedia":
+        return "Wikimedia";
+      default:
+        return source;
+    }
+  };
+
   return (
     <div className="flex h-full flex-col">
       {/* Filter bar */}
       <div className="flex shrink-0 items-center gap-2 px-4 py-3">
-        {(
-          [
-            { id: "all" as const, label: "All", count: streetImages.length + listingPhotos.length },
-            { id: "street" as const, label: "Street View", count: streetImages.length },
-            { id: "listing" as const, label: "Listing", count: listingPhotos.length },
-          ] as const
-        ).map((f) => (
+        {filters.map((f) => (
           <button
             key={f.id}
             onClick={() => setFilter(f.id)}
@@ -64,7 +92,11 @@ export default function ImageGallery({ streetImages, listingPhotos }: ImageGalle
             <button
               key={i}
               onClick={() => setSelectedImage(img)}
-              className="group relative aspect-[4/3] overflow-hidden rounded-lg bg-zinc-100 dark:bg-zinc-800"
+              className={`group relative overflow-hidden rounded-lg bg-zinc-100 dark:bg-zinc-800 ${
+                img.source === "google_satellite"
+                  ? "aspect-square"
+                  : "aspect-[4/3]"
+              }`}
             >
               {/* eslint-disable-next-line @next/next/no-img-element */}
               <img
@@ -76,11 +108,7 @@ export default function ImageGallery({ streetImages, listingPhotos }: ImageGalle
               <div className="absolute inset-0 bg-gradient-to-t from-black/50 to-transparent opacity-0 transition-opacity group-hover:opacity-100" />
               <div className="absolute bottom-0 left-0 right-0 p-2 opacity-0 transition-opacity group-hover:opacity-100">
                 <span className="text-xs font-medium text-white">
-                  {img.source === "google_street_view"
-                    ? "Google Street View"
-                    : img.source === "mapillary"
-                    ? "Mapillary"
-                    : img.source}
+                  {sourceLabel(img.source)}
                 </span>
                 {img.description && (
                   <p className="mt-0.5 truncate text-[10px] text-white/70">

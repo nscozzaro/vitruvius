@@ -1,87 +1,53 @@
 import { NextRequest, NextResponse } from "next/server";
 
-const HEADERS = {
-  "User-Agent":
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-};
-
 /**
  * POST /api/collect_photos
- * Scrapes Redfin and Zillow for property listing photos.
+ * Fetches close-up detail shots from Google Street View at various angles.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { address } = body;
+    const { address, latitude, longitude } = body;
 
     if (!address) {
-      return NextResponse.json({ error: "Missing address" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing address" },
+        { status: 400 }
+      );
     }
 
-    const results: any[] = [];
+    const results: Array<{ url: string; source: string; description?: string }> = [];
 
-    // 1. Redfin Scraper
-    try {
-      const redfinSearch = `https://www.redfin.com/stingray/do/location-autocomplete?location=${encodeURIComponent(
-        address
-      )}&v=2`;
-      const redfinSearchResp = await fetch(redfinSearch, { headers: HEADERS });
-      if (redfinSearchResp.ok) {
-        const text = await redfinSearchResp.text();
-        const urlMatch = text.match(/"url":"(\/[^"]+)"/);
-        if (urlMatch) {
-          const propertyUrl = `https://www.redfin.com${urlMatch[1]}`;
-          const propertyResp = await fetch(propertyUrl, { headers: HEADERS });
-          if (propertyResp.ok) {
-            const html = await propertyResp.text();
-            // Simple regex for img tags since we aren't using Cheerio
-            const imgMatches = html.matchAll(/<img[^>]+src="([^">]+)"[^>]*>/g);
-            let count = 0;
-            for (const match of imgMatches) {
-              const src = match[1];
-              if (src.toLowerCase().includes("photo") || src.includes("genMid")) {
-                results.push({
-                  url: src,
-                  source: "redfin",
-                  description: "Redfin listing photo",
-                });
-                count++;
-                if (count >= 10) break;
-              }
+    const googleKey = process.env.GOOGLE_STREET_VIEW_API_KEY;
+    if (googleKey && latitude && longitude) {
+      const detailViews = [
+        { heading: 0, pitch: 25, fov: 60, desc: "Front elevation (close-up)" },
+        { heading: 180, pitch: 25, fov: 60, desc: "Rear view (close-up)" },
+        { heading: 45, pitch: 15, fov: 70, desc: "Northeast angle" },
+        { heading: 135, pitch: 15, fov: 70, desc: "Southeast angle" },
+        { heading: 225, pitch: 15, fov: 70, desc: "Southwest angle" },
+        { heading: 315, pitch: 15, fov: 70, desc: "Northwest angle" },
+      ];
+
+      for (const view of detailViews) {
+        const metaUrl = `https://maps.googleapis.com/maps/api/streetview/metadata?location=${latitude},${longitude}&heading=${view.heading}&key=${googleKey}`;
+        try {
+          const metaResp = await fetch(metaUrl);
+          if (metaResp.ok) {
+            const meta = await metaResp.json();
+            if (meta.status === "OK") {
+              const imageUrl = `https://maps.googleapis.com/maps/api/streetview?size=800x600&location=${latitude},${longitude}&heading=${view.heading}&pitch=${view.pitch}&fov=${view.fov}&key=${googleKey}`;
+              results.push({
+                url: imageUrl,
+                source: "google_street_view_detail",
+                description: view.desc,
+              });
             }
           }
+        } catch {
+          // Skip this view
         }
       }
-    } catch (err) {
-      console.error("Redfin Scraper Error:", err);
-    }
-
-    // 2. Zillow Scraper
-    try {
-      const slug = address
-        .replace(/[^a-zA-Z0-9]+/g, "-")
-        .replace(/^-|-$/g, "");
-      const zillowUrl = `https://www.zillow.com/homes/${slug}_rb/`;
-      const zillowResp = await fetch(zillowUrl, { headers: HEADERS });
-      if (zillowResp.ok) {
-        const html = await zillowResp.text();
-        const imgMatches = html.matchAll(/<img[^>]+src="([^">]+)"[^>]*>/g);
-        let count = 0;
-        for (const match of imgMatches) {
-          const src = match[1];
-          if (src.includes("zillowstatic") || src.toLowerCase().includes("photos")) {
-            results.push({
-              url: src,
-              source: "zillow",
-              description: "Zillow listing photo",
-            });
-            count++;
-            if (count >= 10) break;
-          }
-        }
-      }
-    } catch (err) {
-      console.error("Zillow Scraper Error:", err);
     }
 
     return NextResponse.json({
@@ -90,9 +56,6 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Photos Error:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch property photos" },
-      { status: 500 }
-    );
+    return NextResponse.json({ source: "combined", images: [] });
   }
 }

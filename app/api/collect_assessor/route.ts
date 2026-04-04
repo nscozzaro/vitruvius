@@ -2,36 +2,22 @@ import { NextRequest, NextResponse } from "next/server";
 
 /**
  * POST /api/collect_assessor
- * Scrapes county property records to get building details.
+ * Fetches property details from OpenStreetMap and public sources.
+ * Falls back gracefully if no data is available.
  */
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const { address } = body;
+    const { address, latitude, longitude } = body;
 
     if (!address) {
-      return NextResponse.json({ error: "Missing address" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Missing address" },
+        { status: 400 }
+      );
     }
 
-    const searchUrl = `https://www.countyoffice.org/property-records-search/?q=${encodeURIComponent(
-      address
-    )}`;
-
-    const response = await fetch(searchUrl, {
-      headers: {
-        "User-Agent":
-          "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36",
-      },
-    });
-
-    if (!response.ok) {
-      return NextResponse.json({ source: "assessor", data: null });
-    }
-
-    const html = await response.text();
-    const plainText = html.replace(/<[^>]*>?/gm, " ").toLowerCase();
-
-    const result: any = {
+    const result: Record<string, unknown> = {
       sqft: null,
       lot_sqft: null,
       bedrooms: null,
@@ -40,45 +26,83 @@ export async function POST(request: NextRequest) {
       stories: null,
       roof_type: null,
       exterior_material: null,
-      raw_data: {},
     };
 
-    // Simple regex matching mirroring the Python logic
-    const sqftMatch = plainText.match(
-      /(?:living\s*area|building\s*area|sqft|sq\s*ft)[:\s]*(\d[\d,]*)/
-    );
-    if (sqftMatch) {
-      result.sqft = parseFloat(sqftMatch[1].replace(/,/g, ""));
+    // 1. Try OSM Nominatim reverse geocode for building info
+    try {
+      const nominatimUrl = `https://nominatim.openstreetmap.org/reverse?format=jsonv2&lat=${latitude}&lon=${longitude}&zoom=18&addressdetails=1&extratags=1&namedetails=1`;
+      const resp = await fetch(nominatimUrl, {
+        headers: { "User-Agent": "Vitruvius/1.0 (building-design-app)" },
+      });
+      if (resp.ok) {
+        const data = await resp.json();
+        const tags = data.extratags || {};
+        if (tags["building:levels"]) {
+          result.stories = parseInt(tags["building:levels"]);
+        }
+        if (tags["roof:shape"]) {
+          result.roof_type = tags["roof:shape"];
+        }
+        if (tags["building:material"]) {
+          result.exterior_material = tags["building:material"];
+        }
+        if (tags["start_date"]) {
+          const year = parseInt(tags["start_date"]);
+          if (year > 1800 && year < 2100) result.year_built = year;
+        }
+      }
+    } catch (err) {
+      console.warn("Nominatim reverse geocode failed:", err);
     }
 
-    const lotMatch = plainText.match(/(?:lot\s*(?:size|area))[:\s]*(\d[\d,]*)/);
-    if (lotMatch) {
-      result.lot_sqft = parseFloat(lotMatch[1].replace(/,/g, ""));
+    // 2. Try Overpass for detailed building tags
+    try {
+      const query = `
+        [out:json][timeout:10];
+        (
+          way["building"](around:30,${latitude},${longitude});
+        );
+        out tags;
+      `.trim();
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 8000);
+
+      const resp = await fetch("https://overpass-api.de/api/interpreter", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({ data: query }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (resp.ok) {
+        const data = await resp.json();
+        for (const el of data.elements || []) {
+          const tags = el.tags || {};
+          if (tags["building:levels"] && !result.stories) {
+            result.stories = parseInt(tags["building:levels"]);
+          }
+          if (tags["roof:shape"] && !result.roof_type) {
+            result.roof_type = tags["roof:shape"];
+          }
+          if (tags["building:material"] && !result.exterior_material) {
+            result.exterior_material = tags["building:material"];
+          }
+          if (tags["start_date"] && !result.year_built) {
+            const year = parseInt(tags["start_date"]);
+            if (year > 1800 && year < 2100) result.year_built = year;
+          }
+          if (tags["height"] && !result.sqft) {
+            // Store height as metadata even if not sqft
+            result.building_height = parseFloat(tags["height"]);
+          }
+        }
+      }
+    } catch {
+      // Overpass may timeout, that's OK
     }
 
-    const bedMatch = plainText.match(/(\d+)\s*(?:bed(?:room)?s?)/);
-    if (bedMatch) {
-      result.bedrooms = parseInt(bedMatch[1]);
-    }
-
-    const bathMatch = plainText.match(/(\d+\.?\d*)\s*(?:bath(?:room)?s?)/);
-    if (bathMatch) {
-      result.bathrooms = parseFloat(bathMatch[1]);
-    }
-
-    const yearMatch = plainText.match(/(?:year\s*built|built\s*in)[:\s]*(\d{4})/);
-    if (yearMatch) {
-      result.year_built = parseInt(yearMatch[1]);
-    }
-
-    const storyMatch = plainText.match(/(\d+)\s*(?:stor(?:y|ies))/);
-    if (storyMatch) {
-      result.stories = parseInt(storyMatch[1]);
-    }
-
-    const hasData = Object.keys(result).some(
-      (k) => result[k] !== null && k !== "raw_data"
-    );
+    const hasData = Object.values(result).some((v) => v != null);
 
     return NextResponse.json({
       source: "assessor",
@@ -86,9 +110,6 @@ export async function POST(request: NextRequest) {
     });
   } catch (error) {
     console.error("Assessor Error:", error);
-    return NextResponse.json(
-      { error: "Failed to fetch assessor data" },
-      { status: 500 }
-    );
+    return NextResponse.json({ source: "assessor", data: null });
   }
 }

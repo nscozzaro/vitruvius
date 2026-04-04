@@ -9,6 +9,8 @@ import {
   collectAssessor,
   collectElevation,
   collectPhotos,
+  collectSatellite,
+  collectParcel,
 } from "@/app/lib/api";
 
 type StepStatus = "pending" | "loading" | "done" | "error";
@@ -31,6 +33,8 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
     { label: "Property records", status: "pending" },
     { label: "Elevation data", status: "pending" },
     { label: "Listing photos", status: "pending" },
+    { label: "Satellite imagery", status: "pending" },
+    { label: "Parcel & permits", status: "pending" },
   ]);
 
   const doneCount = steps.filter((s) => s.status === "done" || s.status === "error").length;
@@ -51,8 +55,10 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
       async () => {
         updateStep(0, { status: "loading" });
         try {
-          const r = await collectOsm(lat, lon);
+          const r = await collectOsm(lat, lon, address);
           results.footprint = r.footprint;
+          results.footprintOrigin = r.origin;
+          results.neighbors = r.neighbors;
           const pts = r.footprint?.length ?? 0;
           updateStep(0, {
             status: "done",
@@ -112,7 +118,7 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
       async () => {
         updateStep(4, { status: "loading" });
         try {
-          const r = await collectPhotos(address);
+          const r = await collectPhotos(address, lat, lon);
           results.listingPhotos = r.images;
           updateStep(4, {
             status: "done",
@@ -121,6 +127,40 @@ export default function DataCollection({ geocoded, onComplete }: DataCollectionP
         } catch {
           updateStep(4, { status: "error", detail: "Failed" });
           results.listingPhotos = [];
+        }
+      },
+      async () => {
+        updateStep(5, { status: "loading" });
+        try {
+          const r = await collectSatellite(lat, lon);
+          results.satelliteImages = r.images;
+          updateStep(5, {
+            status: "done",
+            detail: `${r.images.length} views`,
+          });
+        } catch {
+          updateStep(5, { status: "error", detail: "Failed" });
+          results.satelliteImages = [];
+        }
+      },
+      async () => {
+        updateStep(6, { status: "loading" });
+        try {
+          const r = await collectParcel(lat, lon, address);
+          results.parcel = r.data;
+          if (r.data) {
+            const parts = [];
+            if (r.data.apn) parts.push(`APN ${r.data.apn}`);
+            if (r.data.zoning) parts.push(r.data.zoning);
+            if (r.data.permits?.length) parts.push(`${r.data.permits.length} permits`);
+            if (r.data.parcelBoundary?.length) parts.push("lot lines");
+            updateStep(6, { status: "done", detail: parts.join(" · ") || "Found" });
+          } else {
+            updateStep(6, { status: "done", detail: "Not in coverage area" });
+          }
+        } catch {
+          updateStep(6, { status: "error", detail: "Failed" });
+          results.parcel = null;
         }
       },
     ];

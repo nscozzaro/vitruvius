@@ -31,13 +31,39 @@ export interface FootprintPoint {
   y: number;
 }
 
+export interface ParcelData {
+  apn: string | null;
+  zoning: string | null;
+  landUse: string | null;
+  address: string | null;
+  neighborhood: string | null;
+  parcelBoundary: { lat: number; lon: number }[];
+  permits: { type: string; number: string; category: string }[];
+  extra: Record<string, string | null>;
+  source: string;
+}
+
 export interface CollectionResults {
   geocoded: GeocodedAddress | null;
   footprint: FootprintPoint[] | null;
+  footprintOrigin: { latitude: number; longitude: number } | null;
+  neighbors: { footprint: FootprintPoint[]; address: string | null }[];
   elevation_m: number | null;
   streetImages: CollectedImage[];
   listingPhotos: CollectedImage[];
+  satelliteImages: CollectedImage[];
   assessor: AssessorData | null;
+  parcel: ParcelData | null;
+  uploadedDocuments: UploadedDocument[];
+}
+
+export interface UploadedDocument {
+  filename: string;
+  category: string;
+  confidence: number;
+  summary: string;
+  extractedFields: Record<string, string>;
+  text: string;
 }
 
 async function postJson<T>(url: string, body: Record<string, unknown>): Promise<T> {
@@ -57,11 +83,13 @@ export async function geocodeAddress(address: string): Promise<GeocodedAddress> 
   return postJson("/api/collect", { address });
 }
 
-export async function collectOsm(lat: number, lon: number) {
-  return postJson<{ source: string; footprint: FootprintPoint[] | null }>(
-    "/api/collect_osm",
-    { latitude: lat, longitude: lon }
-  );
+export async function collectOsm(lat: number, lon: number, address?: string) {
+  return postJson<{
+    source: string;
+    footprint: FootprintPoint[] | null;
+    origin: { latitude: number; longitude: number } | null;
+    neighbors: { footprint: FootprintPoint[]; address: string | null }[];
+  }>("/api/collect_osm", { latitude: lat, longitude: lon, address });
 }
 
 export async function collectStreet(lat: number, lon: number) {
@@ -85,10 +113,24 @@ export async function collectElevation(lat: number, lon: number) {
   );
 }
 
-export async function collectPhotos(address: string) {
+export async function collectPhotos(address: string, lat?: number, lon?: number) {
   return postJson<{ source: string; images: CollectedImage[] }>(
     "/api/collect_photos",
-    { address }
+    { address, latitude: lat, longitude: lon }
+  );
+}
+
+export async function collectSatellite(lat: number, lon: number) {
+  return postJson<{ source: string; images: CollectedImage[] }>(
+    "/api/collect_satellite",
+    { latitude: lat, longitude: lon }
+  );
+}
+
+export async function collectParcel(lat: number, lon: number, address?: string) {
+  return postJson<{ source: string; data: ParcelData | null }>(
+    "/api/collect_parcel",
+    { latitude: lat, longitude: lon, address }
   );
 }
 
@@ -101,19 +143,25 @@ export async function collectAll(address: string): Promise<CollectionResults> {
   const { latitude: lat, longitude: lon } = geocoded;
 
   // Step 2: Run all collectors in parallel
-  const [osmResult, streetResult, assessorResult, elevationResult, photosResult] =
+  const [osmResult, streetResult, assessorResult, elevationResult, photosResult, satelliteResult, parcelResult] =
     await Promise.allSettled([
-      collectOsm(lat, lon),
+      collectOsm(lat, lon, address),
       collectStreet(lat, lon),
       collectAssessor(address, lat, lon),
       collectElevation(lat, lon),
-      collectPhotos(address),
+      collectPhotos(address, lat, lon),
+      collectSatellite(lat, lon),
+      collectParcel(lat, lon, address),
     ]);
 
   return {
     geocoded,
     footprint:
       osmResult.status === "fulfilled" ? osmResult.value.footprint : null,
+    footprintOrigin:
+      osmResult.status === "fulfilled" ? osmResult.value.origin : null,
+    neighbors:
+      osmResult.status === "fulfilled" ? osmResult.value.neighbors : [],
     elevation_m:
       elevationResult.status === "fulfilled"
         ? elevationResult.value.elevation_m
@@ -122,7 +170,12 @@ export async function collectAll(address: string): Promise<CollectionResults> {
       streetResult.status === "fulfilled" ? streetResult.value.images : [],
     listingPhotos:
       photosResult.status === "fulfilled" ? photosResult.value.images : [],
+    satelliteImages:
+      satelliteResult.status === "fulfilled" ? satelliteResult.value.images : [],
     assessor:
       assessorResult.status === "fulfilled" ? assessorResult.value.data : null,
+    parcel:
+      parcelResult.status === "fulfilled" ? parcelResult.value.data : null,
+    uploadedDocuments: [],
   };
 }
