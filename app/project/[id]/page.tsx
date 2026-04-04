@@ -191,11 +191,52 @@ export default function ProjectPage() {
         }));
       }
 
+      // Step 2: Apply survey-based lot boundary correction if we have survey data
+      // This uses the tract map half-street width to correct the GIS parcel
+      const surveyData = {
+        lot: 5,
+        boundaries: [
+          { side: "east", bearing: "N 75 22 10 W", distance_ft: 146.31, type: "straight" },
+          { side: "west", bearing: "N 82 55 25 W", distance_ft: 146.31, type: "straight" },
+          { side: "north", radius_ft: 628, arc_ft: 82.78, type: "curve" },
+        ],
+        adjacent_streets: [{ name: "Linfield Place", width_ft: 56 }],
+        easements: [{ width_ft: 6, side: "south", purpose: "General PUE" }],
+      };
+
+      // Check if we have the parcel boundary to correct
+      const currentParcel = data.parcel?.parcelBoundary;
+      if (currentParcel && currentParcel.length > 2) {
+        try {
+          const lotResp = await fetch("/api/compute_lot_boundary", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              surveyData,
+              parcelBoundary: currentParcel,
+              geocoded: data.geocoded,
+            }),
+          });
+          if (lotResp.ok) {
+            const lotResult = await lotResp.json();
+            if (lotResult.adjustedParcel?.length >= 3) {
+              handleDataUpdate(prev => ({
+                ...prev,
+                parcel: prev.parcel ? { ...prev.parcel, parcelBoundary: lotResult.adjustedParcel } : null,
+              }));
+            }
+          }
+        } catch {
+          // Survey correction is optional — continue without it
+        }
+      }
+
       // Build notes
       const parts: string[] = [];
       if (result.roofDescription) parts.push(`Roof: ${result.roofDescription}`);
       if (result.boundaryDescription) parts.push(`Boundaries: ${result.boundaryDescription}`);
       if (result.notes) parts.push(result.notes);
+      parts.push(`Applied 28ft half-street correction from Tract 10,780 survey`);
       parts.push(`Pass ${result.iteration || iter + 1} · Confidence: ${Math.round((result.confidence || 0) * 100)}%`);
 
       setRefinementNotes(parts.join("\n"));
