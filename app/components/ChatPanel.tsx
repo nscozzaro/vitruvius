@@ -166,26 +166,14 @@ export default function ChatPanel({ data, onDataUpdate }: ChatPanelProps) {
   const runCollection = useCallback(async () => {
     if (collectionStartedRef.current || !data.geocoded) return;
 
-    // Already collected? Skip to upload phase or chat
+    // Already collected (came from wizard or cache)? Go straight to chat.
     const hasData = data.footprint || data.streetImages.length > 0 || data.parcel;
     if (hasData) {
-      const hasUploads = data.uploadedDocuments?.length > 0;
-      if (hasUploads) {
-        setPhase("chat");
-        setMessages([{
-          id: nextId(), role: "assistant",
-          content: `Data loaded for **${data.geocoded.address}**. How can I help?`,
-        }]);
-      } else {
-        setPhase("uploading");
-        setMessages([
-          {
-            id: nextId(), role: "assistant",
-            content: `Data loaded for **${data.geocoded.address}**. Upload your project documents to enhance the site plan:`,
-          },
-          { id: nextId(), role: "upload-prompt", content: "" },
-        ]);
-      }
+      setPhase("chat");
+      setMessages([{
+        id: nextId(), role: "assistant",
+        content: `Ready to help with **${data.geocoded.address}**. Ask about the property, request a site plan, or upload documents with the 📎 button.`,
+      }]);
       collectionStartedRef.current = true;
       return;
     }

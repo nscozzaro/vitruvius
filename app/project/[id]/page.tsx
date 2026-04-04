@@ -134,30 +134,12 @@ export default function ProjectPage() {
   };
 
   const handleRefineWithAI = async () => {
-    if (!data || refining) return;
+    if (!data || refining || !data.footprint) return;
     setRefining(true);
     setRefinementNotes(null);
 
     try {
-      // Build satellite image URL for the AI to analyze
-      const googleKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_KEY || "";
       const origin = data.footprintOrigin || { latitude: data.geocoded!.latitude, longitude: data.geocoded!.longitude };
-      const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
-      const fp = (data.footprint || []).map(pt => ({
-        lat: origin.latitude + pt.y / 110540,
-        lon: origin.longitude + pt.x / (111320 * cosDeg(origin.latitude)),
-      }));
-      const avgLat = fp.reduce((s, p) => s + p.lat, 0) / (fp.length || 1);
-      const avgLon = fp.reduce((s, p) => s + p.lon, 0) / (fp.length || 1);
-
-      // Build the overlay URL
-      const pathStr = [...fp, fp[0]].map(p => `${p.lat.toFixed(7)},${p.lon.toFixed(7)}`).join("|");
-      let imageUrl = `https://maps.googleapis.com/maps/api/staticmap?center=${avgLat.toFixed(7)},${avgLon.toFixed(7)}&zoom=20&size=600x400&scale=2&maptype=satellite&path=color:0x4488FFCC|weight:3|fillcolor:0x4488FF44|${pathStr}`;
-      if (data.parcel?.parcelBoundary?.length) {
-        const pStr = [...data.parcel.parcelBoundary, data.parcel.parcelBoundary[0]].map(p => `${p.lat.toFixed(7)},${p.lon.toFixed(7)}`).join("|");
-        imageUrl += `&path=color:0xFF2222CC|weight:2|fillcolor:0xFF222211|${pStr}`;
-      }
-      if (googleKey) imageUrl += `&key=${googleKey}`;
 
       // Build context from title report data
       const titleDocs = data.uploadedDocuments?.filter(d => d.category === "title") || [];
@@ -169,10 +151,10 @@ export default function ProjectPage() {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          satelliteImageUrl: imageUrl,
           footprint: data.footprint,
           parcelBoundary: data.parcel?.parcelBoundary,
           origin,
+          geocoded: data.geocoded,
           context,
         }),
       });
@@ -204,11 +186,25 @@ export default function ProjectPage() {
         }));
       }
 
-      const notes = [result.notes, ...(result.observations || [])].filter(Boolean).join("\n• ");
-      setRefinementNotes(notes || "No adjustments suggested.");
+      // Build detailed notes
+      const parts: string[] = [];
+      if (result.footprintOffset?.x || result.footprintOffset?.y) {
+        parts.push(`Footprint shifted ${result.footprintOffset.x}m E, ${result.footprintOffset.y}m N`);
+      }
+      if (result.parcelOffset?.lat || result.parcelOffset?.lon) {
+        const pLatM = (result.parcelOffset.lat * 110540).toFixed(1);
+        const pLonM = (result.parcelOffset.lon * 111320 * Math.cos(data.geocoded!.latitude * Math.PI / 180)).toFixed(1);
+        parts.push(`Parcel shifted ${pLonM}m E, ${pLatM}m N`);
+      }
+      if (result.roofDescription) parts.push(`Roof: ${result.roofDescription}`);
+      if (result.boundaryDescription) parts.push(`Boundaries: ${result.boundaryDescription}`);
+      if (result.notes) parts.push(result.notes);
+      parts.push(`Confidence: ${Math.round((result.confidence || 0) * 100)}%`);
+
+      setRefinementNotes(parts.join("\n"));
     } catch (err) {
       console.error("Refinement error:", err);
-      setRefinementNotes("Refinement failed. Try again.");
+      setRefinementNotes("Refinement failed — using original coordinates.");
     } finally {
       setRefining(false);
     }
@@ -365,7 +361,16 @@ export default function ProjectPage() {
                         )}
                         {refinementNotes && (
                           <div className="rounded-xl border border-blue-200 bg-blue-50 p-3 dark:border-blue-900 dark:bg-blue-950/30">
-                            <div className="mb-1 text-[10px] font-bold uppercase tracking-wider text-blue-600">AI Analysis</div>
+                            <div className="mb-1 flex items-center justify-between">
+                              <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600">AI Calibration</span>
+                              <button
+                                onClick={() => { refinementStarted.current = false; setRefinementNotes(null); handleRefineWithAI(); }}
+                                disabled={refining}
+                                className="text-[10px] font-medium text-blue-500 hover:text-blue-700 disabled:opacity-50"
+                              >
+                                Refine again
+                              </button>
+                            </div>
                             <div className="whitespace-pre-wrap text-xs leading-relaxed text-blue-800 dark:text-blue-300">
                               {refinementNotes}
                             </div>
