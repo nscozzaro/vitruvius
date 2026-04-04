@@ -117,16 +117,46 @@ Return the corrected polygons as JSON.`;
       prompt,
       { maxTokens: 2048 }
     );
-    responseText = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
-
+    // Robust JSON extraction — handle markdown fences, preamble text, etc.
     let parsed;
     try {
+      // Try direct parse first
       parsed = JSON.parse(responseText);
     } catch {
-      return NextResponse.json({
-        error: "Failed to parse AI response",
-        raw: responseText.slice(0, 500),
-      });
+      // Strip markdown fences anywhere in the string
+      let cleaned = responseText.replace(/```(?:json)?\s*/g, "").replace(/```/g, "").trim();
+      try {
+        parsed = JSON.parse(cleaned);
+      } catch {
+        // Try to find JSON object in the text
+        const jsonMatch = responseText.match(/\{[\s\S]*"adjustedFootprint"[\s\S]*\}/);
+        if (jsonMatch) {
+          try {
+            parsed = JSON.parse(jsonMatch[0]);
+          } catch { /* fall through */ }
+        }
+        if (!parsed) {
+          // Last resort: try to find any JSON object
+          const anyJson = responseText.match(/\{[\s\S]{20,}\}/);
+          if (anyJson) {
+            try { parsed = JSON.parse(anyJson[0]); } catch { /* fall through */ }
+          }
+        }
+        if (!parsed) {
+          console.warn("Refinement: could not parse response:", responseText.slice(0, 300));
+          // Return a no-op result instead of an error
+          return NextResponse.json({
+            footprint: null,
+            parcelBoundary: null,
+            confidence: 0,
+            notes: "AI returned non-parseable response. Using original coordinates.",
+            roofDescription: "",
+            boundaryDescription: "",
+            shouldIterate: false,
+            iteration: (iteration || 0) + 1,
+          });
+        }
+      }
     }
 
     const adjustedFp = parsed.adjustedFootprint || [];
