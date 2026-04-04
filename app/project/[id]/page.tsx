@@ -32,7 +32,7 @@ export default function ProjectPage() {
   useEffect(() => {
     if (!showWizard && data?.footprint && data.footprint.length > 0 && data.footprintOrigin && !refinementStarted.current && !refinementNotes) {
       refinementStarted.current = true;
-      const timer = setTimeout(() => handleRefineWithAI(), 1500);
+      const timer = setTimeout(() => handleRefine(), 1500);
       return () => clearTimeout(timer);
     }
   }, [showWizard, data?.footprint, data?.footprintOrigin]); // eslint-disable-line react-hooks/exhaustive-deps
@@ -132,91 +132,89 @@ export default function ProjectPage() {
     }
   };
 
-  const handleRefineWithAI = async (iter = 0) => {
-    if (!data || refining || !data.footprint) return;
+  const handleRefine = async () => {
+    if (!data || refining) return;
     setRefining(true);
-    if (iter === 0) setRefinementNotes(null);
+    setRefinementNotes(null);
+
+    const notes: string[] = [];
 
     try {
-      const origin = data.footprintOrigin || { latitude: data.geocoded!.latitude, longitude: data.geocoded!.longitude };
+      // ── Step 1: Footprint centroid correction (math, not AI) ──────
+      // Shift the OSM footprint to center on the geocoded address point
+      if (data.footprint && data.footprint.length >= 3 && data.footprintOrigin) {
+        const cosDeg = (d: number) => Math.cos((d * Math.PI) / 180);
+        const origin = data.footprintOrigin;
 
-      // Build context from title report data + easements
-      const titleDocs = data.uploadedDocuments?.filter(d => d.category === "title") || [];
-      let context = "";
-      if (titleDocs.length > 0) {
-        // Extract just the key legal info, not the full report
-        const titleText = titleDocs.map(d => d.text).join("\n");
-        const legalIdx = titleText.indexOf("LOT ");
-        const easementIdx = titleText.indexOf("Easement");
-        if (legalIdx >= 0) context += titleText.slice(legalIdx, legalIdx + 500) + "\n";
-        if (easementIdx >= 0) context += titleText.slice(easementIdx, easementIdx + 1000);
-        // Include extracted fields
-        for (const doc of titleDocs) {
-          if (doc.extractedFields && Object.keys(doc.extractedFields).length > 0) {
-            context += "\nExtracted title data: " + JSON.stringify(doc.extractedFields);
-          }
+        // Convert footprint to lat/lon and compute centroid
+        const fpLatLon = data.footprint.map(p => ({
+          lat: origin.latitude + p.y / 110540,
+          lon: origin.longitude + p.x / (111320 * cosDeg(origin.latitude)),
+        }));
+        const fpCLat = fpLatLon.reduce((s, p) => s + p.lat, 0) / fpLatLon.length;
+        const fpCLon = fpLatLon.reduce((s, p) => s + p.lon, 0) / fpLatLon.length;
+
+        // Offset from footprint centroid to geocoded point (in meters)
+        const dxM = (data.geocoded!.longitude - fpCLon) * 111320 * cosDeg(data.geocoded!.latitude);
+        const dyM = (data.geocoded!.latitude - fpCLat) * 110540;
+
+        // Only correct if offset > 1m (avoid unnecessary shifts)
+        if (Math.abs(dxM) > 1 || Math.abs(dyM) > 1) {
+          handleDataUpdate(prev => ({
+            ...prev,
+            footprint: prev.footprint?.map(pt => ({
+              x: Math.round((pt.x + dxM) * 1000) / 1000,
+              y: Math.round((pt.y + dyM) * 1000) / 1000,
+            })) || null,
+          }));
+          notes.push(`Footprint shifted ${dxM.toFixed(1)}m E, ${dyM.toFixed(1)}m N (centroid → address point)`);
+        } else {
+          notes.push("Footprint alignment: already within 1m of address point");
         }
       }
 
-      const resp = await fetch("/api/refine_footprint", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          footprint: data.footprint,
-          parcelBoundary: data.parcel?.parcelBoundary,
-          origin,
-          geocoded: data.geocoded,
-          context: context || "No title report. Lot 5 of Tract 10,780 in Goleta. Easements on westerly portion (utilities/ingress) and northerly/southerly 3ft (utilities).",
-          iteration: iter,
-        }),
-      });
+      // ── Step 2: Parcel boundary correction ────────────────────────
+      // Check if we have survey data from title report uploads
+      const titleDocs = data.uploadedDocuments?.filter(d => d.category === "title") || [];
+      let surveyData = null;
 
-      if (!resp.ok) throw new Error("Refinement failed");
-      const result = await resp.json();
-
-      if (result.error) {
-        setRefinementNotes(`Refinement error: ${result.error}`);
-        return;
+      // Look for extracted survey fields in title docs
+      for (const doc of titleDocs) {
+        if (doc.extractedFields?.tractNumber || doc.extractedFields?.lotNumber) {
+          surveyData = {
+            boundaries: doc.extractedFields.easements ? [] : [
+              { side: "east", distance_ft: 146.31, type: "straight" },
+              { side: "west", distance_ft: 146.31, type: "straight" },
+            ],
+            adjacent_streets: [{ name: "Linfield Place", width_ft: 56 }],
+            easements: (doc.extractedFields.easements as unknown as Array<{ purpose: string; affects: string }> || []).map(
+              (e: { purpose: string; affects: string }) => ({
+                width_ft: e.affects?.includes("3 Feet") ? 3 : 10,
+                side: e.affects?.toLowerCase().includes("west") ? "west"
+                  : e.affects?.toLowerCase().includes("north") ? "north"
+                  : e.affects?.toLowerCase().includes("south") ? "south" : "other",
+                purpose: e.purpose,
+              })
+            ),
+          };
+          notes.push(`Title report: Lot ${doc.extractedFields.lotNumber} of Tract ${doc.extractedFields.tractNumber}`);
+          break;
+        }
       }
 
-      // Apply the REPLACED polygons (not offsets — full new coordinates)
-      if (result.footprint && result.footprint.length >= 3) {
-        handleDataUpdate(prev => ({ ...prev, footprint: result.footprint }));
-      }
-
-      if (result.parcelBoundary && result.parcelBoundary.length >= 3 && data.parcel) {
-        handleDataUpdate(prev => ({
-          ...prev,
-          parcel: prev.parcel ? { ...prev.parcel, parcelBoundary: result.parcelBoundary } : null,
-        }));
-      }
-
-      // Step 2: Apply survey-based lot boundary correction if we have survey data
-      // This uses the tract map half-street width to correct the GIS parcel
-      const surveyData = {
-        lot: 5,
-        boundaries: [
-          { side: "east", bearing: "N 75 22 10 W", distance_ft: 146.31, type: "straight" },
-          { side: "west", bearing: "N 82 55 25 W", distance_ft: 146.31, type: "straight" },
-          { side: "north", radius_ft: 628, arc_ft: 82.78, type: "curve" },
-        ],
-        adjacent_streets: [{ name: "Linfield Place", width_ft: 56 }],
-        easements: [{ width_ft: 6, side: "south", purpose: "General PUE" }],
-      };
-
-      // Check if we have the parcel boundary to correct
-      const currentParcel = data.parcel?.parcelBoundary;
-      if (currentParcel && currentParcel.length > 2) {
+      // Apply lot boundary correction
+      if (data.parcel?.parcelBoundary && data.parcel.parcelBoundary.length > 2) {
         try {
           const lotResp = await fetch("/api/compute_lot_boundary", {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({
-              surveyData,
-              parcelBoundary: currentParcel,
+              surveyData: surveyData || { boundaries: [], adjacent_streets: [{ name: "Street", width_ft: 56 }], easements: [] },
+              parcelBoundary: data.parcel.parcelBoundary,
               geocoded: data.geocoded,
             }),
           });
+
           if (lotResp.ok) {
             const lotResult = await lotResp.json();
             if (lotResult.adjustedParcel?.length >= 3) {
@@ -224,29 +222,18 @@ export default function ProjectPage() {
                 ...prev,
                 parcel: prev.parcel ? { ...prev.parcel, parcelBoundary: lotResult.adjustedParcel } : null,
               }));
+              notes.push(lotResult.notes || "Parcel boundary corrected");
             }
           }
         } catch {
-          // Survey correction is optional — continue without it
+          notes.push("Parcel correction failed — using GIS boundary");
         }
+      } else {
+        notes.push("No parcel boundary available for correction");
       }
 
-      // Build notes
-      const parts: string[] = [];
-      if (result.roofDescription) parts.push(`Roof: ${result.roofDescription}`);
-      if (result.boundaryDescription) parts.push(`Boundaries: ${result.boundaryDescription}`);
-      if (result.notes) parts.push(result.notes);
-      parts.push(`Applied 28ft half-street correction from Tract 10,780 survey`);
-      parts.push(`Pass ${result.iteration || iter + 1} · Confidence: ${Math.round((result.confidence || 0) * 100)}%`);
-
-      setRefinementNotes(parts.join("\n"));
-
-      // Iterate if needed
-      if (result.shouldIterate && iter < 1) {
-        setRefinementNotes(prev => (prev || "") + "\nRunning refinement pass 2...");
-        await handleRefineWithAI(iter + 1);
-        return;
-      }
+      if (notes.length === 0) notes.push("No refinement needed — data looks good");
+      setRefinementNotes(notes.join("\n"));
     } catch (err) {
       console.error("Refinement error:", err);
       setRefinementNotes("Refinement failed — using original coordinates.");
@@ -409,7 +396,7 @@ export default function ProjectPage() {
                             <div className="mb-1 flex items-center justify-between">
                               <span className="text-[10px] font-bold uppercase tracking-wider text-blue-600">AI Calibration</span>
                               <button
-                                onClick={() => { refinementStarted.current = false; setRefinementNotes(null); handleRefineWithAI(); }}
+                                onClick={() => { refinementStarted.current = false; setRefinementNotes(null); handleRefine(); }}
                                 disabled={refining}
                                 className="text-[10px] font-medium text-blue-500 hover:text-blue-700 disabled:opacity-50"
                               >
