@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { callLLM } from "@/app/lib/llm";
 
 const SYSTEM_PROMPT = `You are an architectural document analyzer. Given text extracted from a PDF document, you must:
 
@@ -37,25 +37,17 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Missing filename" }, { status: 400 });
     }
 
-    const apiKey =
-      process.env.GOOGLE_GEMINI_API_KEY ||
-      process.env.GOOGLE_STREET_VIEW_API_KEY;
-
-    if (!apiKey) {
-      // Fallback: categorize by filename only
-      return NextResponse.json(categorizeByFilename(filename));
-    }
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: "gemini-3-flash-preview",
-      systemInstruction: SYSTEM_PROMPT,
-    });
-
     const prompt = `Filename: "${filename}"\n\nExtracted text (may be limited for scanned docs):\n${(text || "[No text extracted — likely a scanned document]").slice(0, 15000)}`;
 
-    const result = await model.generateContent(prompt);
-    let responseText = result.response.text();
+    let responseText: string;
+    try {
+      responseText = await callLLM([
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: prompt },
+      ]);
+    } catch {
+      return NextResponse.json(categorizeByFilename(filename));
+    }
 
     // Strip markdown fences if present
     responseText = responseText

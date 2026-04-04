@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { GoogleGenerativeAI } from "@google/generative-ai";
+import { callLLM } from "@/app/lib/llm";
 
 const SYSTEM_PROMPT = `You are a real estate title report analyzer. Given the text of a preliminary title report, extract ALL relevant property data into structured JSON.
 
@@ -19,14 +19,7 @@ Extract these fields when present:
 - encumbrances: Array of {type, holder, amount, recordingDate}
 - notes: Array of notable findings from the report
 
-Return ONLY valid JSON, no markdown fences:
-{
-  "apn": "073-200-014",
-  "legalDescription": "LOT 5 OF TRACT 10,780...",
-  "lotNumber": "5",
-  "tractNumber": "10780",
-  ...
-}`;
+Return ONLY valid JSON, no markdown fences.`;
 
 export async function POST(request: NextRequest) {
   try {
@@ -37,29 +30,21 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "No text provided" }, { status: 400 });
     }
 
-    const apiKey = process.env.GOOGLE_GEMINI_API_KEY || process.env.GOOGLE_STREET_VIEW_API_KEY;
-    if (!apiKey) {
-      return NextResponse.json({ error: "No API key" }, { status: 500 });
-    }
-
-    const genAI = new GoogleGenerativeAI(apiKey);
-    const model = genAI.getGenerativeModel({
-      model: "gemini-3-flash-preview",
-      systemInstruction: SYSTEM_PROMPT,
-    });
-
-    const result = await model.generateContent(
-      `Extract structured data from this title report:\n\n${text.slice(0, 30000)}`
+    const responseText = await callLLM(
+      [
+        { role: "system", content: SYSTEM_PROMPT },
+        { role: "user", content: `Extract structured data from this title report:\n\n${text.slice(0, 30000)}` },
+      ],
+      { maxTokens: 2048 }
     );
 
-    let responseText = result.response.text();
-    responseText = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
+    const cleaned = responseText.replace(/^```(?:json)?\n?/m, "").replace(/\n?```$/m, "").trim();
 
     try {
-      const parsed = JSON.parse(responseText);
+      const parsed = JSON.parse(cleaned);
       return NextResponse.json({ data: parsed });
     } catch {
-      return NextResponse.json({ data: null, raw: responseText });
+      return NextResponse.json({ data: null, raw: cleaned });
     }
   } catch (error) {
     console.error("Title extraction error:", error);
