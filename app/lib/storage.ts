@@ -44,7 +44,7 @@ async function uploadPdf(path: string, buf: Buffer): Promise<string> {
       "Content-Type": "application/pdf",
       "x-upsert": "true",
     },
-    body: buf,
+    body: new Uint8Array(buf),
     signal: AbortSignal.timeout(30000),
   });
 
