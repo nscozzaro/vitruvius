@@ -1,7 +1,8 @@
 import { NextRequest } from "next/server";
 import { geocode, getAPN, apnToAssessorMapUrl } from "@/app/lib/parcels";
-import { fetchPdf, extractTractReference } from "@/app/lib/pdf";
+import { fetchPdf } from "@/app/lib/pdf";
 import { searchRecorder } from "@/app/lib/recorder";
+import { findTracts } from "@/app/lib/tract-lookup";
 import {
   ensureStored,
   assessorStoragePath,
@@ -11,9 +12,10 @@ import {
 /**
  * POST /api/tract-map
  *
- * Pipeline: address → geocode → APN → assessor map PDF → LLM vision →
+ * Pipeline: address → geocode → spatial lookup (GeoJSON index) →
  *           book/page → download from surveyor → store in Supabase Storage
  *
+ * Also downloads the assessor parcel map for reference.
  * Returns stable Supabase CDN URLs that never expire.
  */
 
@@ -35,7 +37,7 @@ export async function POST(request: NextRequest) {
         const { lat, lon } = await geocode(address);
         send({ type: "step", message: `Found location (${lat.toFixed(4)}, ${lon.toFixed(4)})` });
 
-        // Step 2: APN
+        // Step 2: APN (for assessor map)
         send({ type: "step", message: "Looking up parcel…" });
         const apn = await getAPN(lat, lon);
         if (!apn) {
@@ -44,64 +46,77 @@ export async function POST(request: NextRequest) {
         }
         send({ type: "step", message: `Found parcel APN: ${apn}` });
 
-        // Step 3: Upload assessor map to storage (or return existing URL)
-        send({ type: "step", message: "Downloading assessor parcel map…" });
-        const assessorMapUrl = apnToAssessorMapUrl(apn);
-        const assessorPath = assessorStoragePath(apn);
+        // Step 3: Spatial lookup — find tract maps that contain this point
+        send({ type: "step", message: "Looking up tract maps…" });
+        const tracts = findTracts(lat, lon);
 
-        // We need the PDF buffer both for storage and for LLM extraction
-        const pdfBuf = await fetchPdf(assessorMapUrl);
-        if (!pdfBuf) {
-          send({ type: "error", message: `Could not fetch assessor map for APN ${apn}` });
-          return;
-        }
+        // Pick the most specific tract (highest project number = most recent subdivision)
+        const tract = tracts.length > 0 ? tracts[0] : null;
 
-        // Upload to Supabase (skips if already stored)
-        const assessorStorageUrl = await ensureStored(assessorPath, async () => pdfBuf);
+        if (tract) {
+          const endPage = tract.sheets && tract.sheets > 1
+            ? String(tract.page + tract.sheets - 1)
+            : undefined;
+          const pageLabel = endPage
+            ? `Pages ${tract.page}–${endPage}`
+            : `Page ${tract.page}`;
+          send({ type: "step", message: `Found: Book ${tract.book}, ${pageLabel}${tract.projCode ? ` (${tract.projCode})` : ""}` });
 
-        // Step 4: Extract tract reference via LLM
-        send({ type: "step", message: "Reading map with AI…" });
-        const tractInfo = await extractTractReference(pdfBuf);
-        if (!tractInfo) {
+          // Step 4: Download assessor map + subdivision map in parallel
+          send({ type: "step", message: "Downloading maps…" });
+
+          const assessorPath = assessorStoragePath(apn);
+          const surveyorPath = surveyorStoragePath(
+            tract.book,
+            String(tract.page),
+            endPage,
+          );
+
+          const [assessorStorageUrl, tractMapUrl] = await Promise.all([
+            ensureStored(assessorPath, () => fetchPdf(apnToAssessorMapUrl(apn))),
+            ensureStored(surveyorPath, () =>
+              searchRecorder(tract.book, String(tract.page), endPage),
+            ),
+          ]);
+
+          const tractInfo = {
+            book: tract.book,
+            page: String(tract.page),
+            endPage,
+            tractNumber: tract.projectNo ? String(tract.projectNo) : undefined,
+            mapType: tract.projCode?.startsWith("T") ? "Tract Map" : "Recorded Map",
+          };
+
+          if (tractMapUrl) {
+            send({
+              type: "result",
+              tractInfo,
+              assessorUrl: assessorStorageUrl,
+              tractMapUrl,
+            });
+          } else {
+            send({
+              type: "result",
+              tractInfo,
+              assessorUrl: assessorStorageUrl,
+              tractMapUrl: null,
+              message: "Found the tract reference but could not download the subdivision map from the county surveyor.",
+            });
+          }
+        } else {
+          // No tract found via spatial lookup — still show assessor map
+          send({ type: "step", message: "Downloading assessor parcel map…" });
+          const assessorPath = assessorStoragePath(apn);
+          const assessorStorageUrl = await ensureStored(assessorPath, () =>
+            fetchPdf(apnToAssessorMapUrl(apn)),
+          );
+
           send({
             type: "result",
             tractInfo: null,
             assessorUrl: assessorStorageUrl,
             tractMapUrl: null,
-            message: "Could not find a tract map reference. This parcel may predate modern subdivision records. Showing the assessor parcel map.",
-          });
-          return;
-        }
-        const pageLabel = tractInfo.endPage
-          ? `Pages ${tractInfo.page}–${tractInfo.endPage}`
-          : `Page ${tractInfo.page}`;
-        send({ type: "step", message: `Found: Book ${tractInfo.book}, ${pageLabel}` });
-
-        // Step 5: Download subdivision map and upload to storage
-        send({ type: "step", message: "Downloading subdivision map from county surveyor…" });
-        const surveyorPath = surveyorStoragePath(
-          tractInfo.book,
-          tractInfo.page,
-          tractInfo.endPage,
-        );
-        const tractMapUrl = await ensureStored(surveyorPath, () =>
-          searchRecorder(tractInfo.book, tractInfo.page, tractInfo.endPage),
-        );
-
-        if (tractMapUrl) {
-          send({
-            type: "result",
-            tractInfo,
-            assessorUrl: assessorStorageUrl,
-            tractMapUrl,
-          });
-        } else {
-          send({
-            type: "result",
-            tractInfo,
-            assessorUrl: assessorStorageUrl,
-            tractMapUrl: null,
-            message: "Found the tract reference but could not download the subdivision map from the county surveyor.",
+            message: "No tract map found for this location. This parcel may predate modern subdivision records. Showing the assessor parcel map.",
           });
         }
       } catch (err) {
