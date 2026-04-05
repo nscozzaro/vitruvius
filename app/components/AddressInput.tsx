@@ -26,15 +26,17 @@ export default function AddressInput({ onSubmit, disabled }: AddressInputProps) 
   }, []);
 
   useEffect(() => {
-    const timer = setTimeout(async () => {
-      if (!address.trim()) {
-        setSuggestions([]);
-        return;
-      }
-      if (suggestions.includes(address)) return;
+    const trimmed = address.trim();
+    if (trimmed.length < 5) {
+      setSuggestions([]);
+      setShowDropdown(false);
+      return;
+    }
+    if (suggestions.includes(address)) return;
 
+    const timer = setTimeout(async () => {
       try {
-        const res = await fetch(`/api/autocomplete?q=${encodeURIComponent(address)}`);
+        const res = await fetch(`/api/autocomplete?q=${encodeURIComponent(trimmed)}`);
         if (res.ok) {
           const data = await res.json();
           setSuggestions(data);
@@ -44,7 +46,7 @@ export default function AddressInput({ onSubmit, disabled }: AddressInputProps) 
       } catch (err) {
         console.error(err);
       }
-    }, 400);
+    }, 600);
 
     return () => clearTimeout(timer);
   }, [address]);

@@ -32,6 +32,7 @@ export async function callLLM(
       max_tokens: options?.maxTokens ?? 1024,
       temperature: options?.temperature ?? 0.7,
     }),
+    signal: AbortSignal.timeout(45000),
   });
 
   if (!resp.ok) {
@@ -78,6 +79,7 @@ export async function callVisionLLM(
       max_tokens: options?.maxTokens ?? 1024,
       temperature: options?.temperature ?? 0.7,
     }),
+    signal: AbortSignal.timeout(45000),
   });
 
   if (!resp.ok) {

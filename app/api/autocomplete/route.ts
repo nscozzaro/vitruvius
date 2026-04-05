@@ -13,9 +13,10 @@ export async function GET(request: NextRequest) {
       return NextResponse.json([]);
     }
 
+    // Bias results toward Santa Barbara County area for better local results
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(
       q
-    )}&format=json&addressdetails=1&limit=5&countrycodes=us`;
+    )}&format=json&addressdetails=1&limit=5&countrycodes=us&viewbox=-120.7,34.0,-119.3,35.0&bounded=0`;
 
     const response = await fetch(url, {
       headers: {

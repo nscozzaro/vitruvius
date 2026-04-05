@@ -4,8 +4,8 @@
     {
       "name": "next-dev",
       "runtimeExecutable": "/usr/bin/env",
-      "runtimeArgs": ["-S", "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "node", "/Users/genevievefox/Documents/Nic/vitruvius/node_modules/.bin/next", "dev", "--webpack", "/Users/genevievefox/Documents/Nic/vitruvius/.claude/worktrees/fervent-raman"],
-      "port": 3001
+      "runtimeArgs": ["-S", "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "node", "/Users/genevievefox/Documents/Nic/vitruvius/node_modules/.bin/next", "dev"],
+      "port": 3000
     }
   ]
 }
