@@ -3,6 +3,7 @@
  *
  * geocode        – address → lat/lon via Nominatim
  * getAPN         – lat/lon → APN (MAGNET → SB City ArcGIS → SB County ArcGIS)
+ * fetchPdf       – download a PDF to a Buffer
  * apnToAssessorMapUrl – APN → assessor parcel map PDF URL
  */
 
@@ -95,4 +96,19 @@ export async function getAPN(
 export function apnToAssessorMapUrl(apn: string): string {
   const key = apn.replace(/-/g, "").slice(0, 5);
   return `http://sbcvote.com/assessor/maps_pdfs/${key}.pdf`;
+}
+
+/** Download a PDF from a URL and return it as a Buffer. */
+export async function fetchPdf(url: string): Promise<Buffer | null> {
+  try {
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Vitruvius/1.0" },
+      signal: AbortSignal.timeout(15000),
+      redirect: "follow",
+    });
+    if (!resp.ok) return null;
+    return Buffer.from(await resp.arrayBuffer());
+  } catch {
+    return null;
+  }
 }

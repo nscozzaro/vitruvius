@@ -1,6 +1,5 @@
 import { NextRequest } from "next/server";
-import { geocode, getAPN, apnToAssessorMapUrl } from "@/app/lib/parcels";
-import { fetchPdf } from "@/app/lib/pdf";
+import { geocode, getAPN, apnToAssessorMapUrl, fetchPdf } from "@/app/lib/parcels";
 import { searchRecorder } from "@/app/lib/recorder";
 import { findTracts } from "@/app/lib/tract-lookup";
 import {
