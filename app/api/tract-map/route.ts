@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { geocode, getAPN, apnToAssessorMapUrl, fetchPdf } from "@/app/lib/parcels";
 import { searchRecorder } from "@/app/lib/recorder";
-import { findTracts } from "@/app/lib/tract-lookup";
+import { findTracts, recordTypeLabel } from "@/app/lib/tract-lookup";
 import {
   ensureStored,
   assessorStoragePath,
@@ -14,8 +14,8 @@ import {
  * Pipeline: address → geocode → spatial lookup (GeoJSON index) →
  *           book/page → download from surveyor → store in Supabase Storage
  *
- * Also downloads the assessor parcel map for reference.
- * Returns stable Supabase CDN URLs that never expire.
+ * The spatial index covers 11,628 recorded maps: Tract Maps, Records of
+ * Survey, and Condo Maps. Returns stable Supabase CDN URLs.
  */
 
 export const maxDuration = 60;
@@ -45,11 +45,11 @@ export async function POST(request: NextRequest) {
         }
         send({ type: "step", message: `Found parcel APN: ${apn}` });
 
-        // Step 3: Spatial lookup — find tract maps that contain this point
-        send({ type: "step", message: "Looking up tract maps…" });
+        // Step 3: Spatial lookup — find recorded maps that contain this point
+        send({ type: "step", message: "Looking up recorded maps…" });
         const tracts = findTracts(lat, lon);
 
-        // Pick the most specific tract (highest project number = most recent subdivision)
+        // Pick the best match (sorted: tracts first, then condos, then surveys)
         const tract = tracts.length > 0 ? tracts[0] : null;
 
         if (tract) {
@@ -59,9 +59,11 @@ export async function POST(request: NextRequest) {
           const pageLabel = endPage
             ? `Pages ${tract.page}–${endPage}`
             : `Page ${tract.page}`;
-          send({ type: "step", message: `Found: Book ${tract.book}, ${pageLabel}${tract.projCode ? ` (${tract.projCode})` : ""}` });
+          const label = recordTypeLabel(tract.recordType);
+          const projLabel = tract.projectNo ? ` ${tract.projectNo}` : "";
+          send({ type: "step", message: `Found: ${label}${projLabel} — Book ${tract.book}, ${pageLabel}` });
 
-          // Step 4: Download assessor map + subdivision map in parallel
+          // Step 4: Download assessor map + recorded map in parallel
           send({ type: "step", message: "Downloading maps…" });
 
           const assessorPath = assessorStoragePath(apn);
@@ -83,7 +85,7 @@ export async function POST(request: NextRequest) {
             page: String(tract.page),
             endPage,
             tractNumber: tract.projectNo ? String(tract.projectNo) : undefined,
-            mapType: tract.projCode?.startsWith("T") ? "Tract Map" : "Recorded Map",
+            mapType: label,
           };
 
           if (tractMapUrl) {
@@ -99,11 +101,11 @@ export async function POST(request: NextRequest) {
               tractInfo,
               assessorUrl: assessorStorageUrl,
               tractMapUrl: null,
-              message: "Found the tract reference but could not download the subdivision map from the county surveyor.",
+              message: `Found the ${label.toLowerCase()} reference but could not download it from the county surveyor.`,
             });
           }
         } else {
-          // No tract found via spatial lookup — still show assessor map
+          // No match via spatial lookup — still show assessor map
           send({ type: "step", message: "Downloading assessor parcel map…" });
           const assessorPath = assessorStoragePath(apn);
           const assessorStorageUrl = await ensureStored(assessorPath, () =>
@@ -115,7 +117,7 @@ export async function POST(request: NextRequest) {
             tractInfo: null,
             assessorUrl: assessorStorageUrl,
             tractMapUrl: null,
-            message: "No tract map found for this location. This parcel may predate modern subdivision records. Showing the assessor parcel map.",
+            message: "No recorded map found in the spatial index for this location. This parcel may use an older survey not yet digitized by the county. Showing the assessor parcel map.",
           });
         }
       } catch (err) {

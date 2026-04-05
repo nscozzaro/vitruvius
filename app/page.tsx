@@ -192,8 +192,14 @@ export default function Home() {
                 )}
                 {state.tractMapUrl && (
                   <MapCard
-                    title="Recorded Subdivision Map"
-                    description="Original survey with lot dimensions, bearings, and easements"
+                    title={state.tractInfo?.mapType ?? "Recorded Map"}
+                    description={
+                      state.tractInfo?.mapType === "Record of Survey"
+                        ? "Surveyor's record showing boundary lines and measurements"
+                        : state.tractInfo?.mapType === "Condo Map"
+                          ? "Condominium plan showing unit boundaries and common areas"
+                          : "Original survey with lot dimensions, bearings, and easements"
+                    }
                     pdfUrl={state.tractMapUrl}
                     icon="survey"
                   />

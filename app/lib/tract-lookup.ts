@@ -1,15 +1,17 @@
 /**
- * Spatial tract map lookup using a pre-converted GeoJSON index.
+ * Spatial recorded-map lookup using a pre-converted GeoJSON index.
  *
- * The GeoJSON file contains 2,326 tract map polygons from the
- * Santa Barbara County Surveyor's spatial index, converted from
- * NAD83 State Plane CA V (feet) to WGS84.
+ * The GeoJSON file contains 11,628 polygons from the Santa Barbara
+ * County Surveyor's spatial indices (Tract Maps, Records of Survey,
+ * and Condo Maps), converted from NAD83 State Plane CA V (feet) to WGS84.
  *
- * Given a lat/lon, this finds which tract map polygon(s) contain
- * the point, returning book/page info for the recorded map.
+ * Given a lat/lon, this finds which recorded map polygon(s) contain
+ * the point, returning book/page info.
  */
 
-import tractMapsData from "@/app/data/tract-maps.json";
+import mapsData from "@/app/data/tract-maps.json";
+
+export type RecordType = "tract" | "survey" | "condo";
 
 export interface TractMatch {
   book: string;
@@ -19,19 +21,12 @@ export interface TractMatch {
   projectNo: number | null;
   title: string;
   descript: string;
+  recordType: RecordType;
 }
 
 interface GeoJSONFeature {
   type: "Feature";
-  properties: {
-    book: string;
-    page: number;
-    sheets: number | null;
-    projCode: string;
-    projectNo: number | null;
-    title: string;
-    descript: string;
-  };
+  properties: TractMatch;
   geometry: {
     type: "Polygon";
     coordinates: number[][][];
@@ -43,7 +38,7 @@ interface GeoJSONCollection {
   features: GeoJSONFeature[];
 }
 
-const data = tractMapsData as GeoJSONCollection;
+const data = mapsData as unknown as GeoJSONCollection;
 
 /**
  * Ray-casting algorithm for point-in-polygon test.
@@ -64,23 +59,36 @@ function pointInRing(lon: number, lat: number, ring: number[][]): boolean {
   return inside;
 }
 
+/** Human-readable label for a record type. */
+export function recordTypeLabel(rt: RecordType): string {
+  switch (rt) {
+    case "tract": return "Tract Map";
+    case "survey": return "Record of Survey";
+    case "condo": return "Condo Map";
+  }
+}
+
 /**
- * Find all tract maps whose polygon contains the given lat/lon.
- * Returns matches sorted by most specific (smallest area) first.
+ * Find all recorded maps whose polygon contains the given lat/lon.
+ * Returns matches sorted: tracts first (by projectNo desc), then surveys, then condos.
  */
 export function findTracts(lat: number, lon: number): TractMatch[] {
   const matches: TractMatch[] = [];
 
   for (const feature of data.features) {
     const rings = feature.geometry.coordinates;
-    // Check outer ring (first ring); holes would need subtraction
     if (rings.length > 0 && pointInRing(lon, lat, rings[0])) {
       matches.push(feature.properties);
     }
   }
 
-  // Sort by projectNo descending — higher number = more recent/specific subdivision
-  matches.sort((a, b) => (b.projectNo ?? 0) - (a.projectNo ?? 0));
+  // Sort: tracts first (most specific subdivision), then surveys, then condos
+  const typeOrder: Record<RecordType, number> = { tract: 0, condo: 1, survey: 2 };
+  matches.sort((a, b) => {
+    const typeDiff = typeOrder[a.recordType] - typeOrder[b.recordType];
+    if (typeDiff !== 0) return typeDiff;
+    return (b.projectNo ?? 0) - (a.projectNo ?? 0);
+  });
 
   return matches;
 }
