@@ -62,9 +62,10 @@ export async function extractTractReference(
             role: "system",
             content:
               `You are analyzing text from a Santa Barbara County Assessor's parcel map PDF. ` +
-              `Find the RECORDED MAP reference (tract map or parcel map) that created these parcels. ` +
-              `Look for patterns like "T.M. 76/20-22", "TRACT MAP BOOK 76 PAGE 20", "P.M. 45/67", "BK 76 PG 20".\n\n` +
-              `Reply ONLY with JSON: {"book":"76","page":"20","tractNumber":"10780","mapType":"Tract Map","rawText":"T.M. 76/20-22"}\n` +
+              `Find the RECORDED MAP reference. Look for patterns like:\n` +
+              `- "R.M. Bk. 15, Pg. 81" (most common format)\n` +
+              `- "T.M. 76/20-22", "P.M. 45/67", "BK 76 PG 20"\n\n` +
+              `Reply ONLY with JSON: {"book":"15","page":"81","tractNumber":null,"mapType":"Recorded Map","rawText":"R.M. Bk. 15, Pg. 81"}\n` +
               `If not found: {"book":null,"page":null}`,
           },
           { role: "user", content: text.slice(0, 8000) },
@@ -82,19 +83,24 @@ export async function extractTractReference(
   try {
     const raw = await callVisionLLM(
       `You are analyzing a Santa Barbara County Assessor's parcel map (scanned document). ` +
-      `Find the RECORDED MAP reference that originally created these parcels. Look for:\n` +
+      `Find the RECORDED MAP reference. It is usually printed at the BOTTOM of the page in small text. Look for these patterns:\n` +
+      `- "R.M. Bk. 15, Pg. 81" (Recorded Map Book/Page — most common)\n` +
       `- "T.M. 76/20-22" or "TRACT MAP BOOK 76 PAGE 20"\n` +
-      `- "P.M. 45/67" (parcel map)\n` +
-      `- "BK 76 PG 20" or "76/20" annotations\n\n` +
-      `Reply ONLY with JSON: {"book":"76","page":"20","tractNumber":"10780","mapType":"Tract Map","rawText":"T.M. 76/20-22"}\n` +
+      `- "P.M. 45/67" (Parcel Map)\n` +
+      `- "BK 76 PG 20" or "76/20" annotations within the map\n` +
+      `- "R.M. Bk. XX, Pg. YY — [Tract Name]"\n\n` +
+      `The reference may include a page range like "Pg. 20-22" (3 pages) or a tract name like "Isla Vista Tract".\n\n` +
+      `Reply ONLY with JSON: {"book":"15","page":"81","tractNumber":null,"mapType":"Recorded Map","rawText":"R.M. Bk. 15, Pg. 81 — Isla Vista Tract"}\n` +
       `If not found: {"book":null,"page":null}`,
       pngBase64,
       "image/png",
-      "Find the recorded tract map or parcel map book and page reference.",
+      "Look carefully at the BOTTOM of the map for the recorded map book and page reference (R.M. Bk. XX, Pg. YY).",
       { maxTokens: 256, temperature: 0 },
     );
+    console.log("[vision] LLM response:", raw);
     return tractInfoFromJSON(raw);
-  } catch {
+  } catch (err) {
+    console.error("[vision] LLM error:", err);
     return null;
   }
 }
@@ -119,11 +125,16 @@ async function renderPdfToPng(buf: Buffer): Promise<string | null> {
   try {
     await writeFile(pdfPath, buf);
 
-    // Render at 150 DPI — balances readability vs file size for the vision API
+    // Render page 1 to PNG, capped at 2048px on the longest side
+    // (Llama Maverick vision model max resolution is 2048x2048)
     let rendered = false;
     for (const bin of PDFTOPPM_CANDIDATES) {
       try {
-        await execFileAsync(bin, ["-r", "150", "-png", "-f", "1", "-l", "1", pdfPath, pngPrefix]);
+        await execFileAsync(bin, [
+          "-png", "-f", "1", "-l", "1",
+          "-scale-to", "2048",
+          pdfPath, pngPrefix,
+        ]);
         rendered = true;
         break;
       } catch { /* try next candidate */ }
@@ -143,18 +154,21 @@ async function renderPdfToPng(buf: Buffer): Promise<string | null> {
 }
 
 function parseTractFromText(text: string): TractInfo | null {
-  // Match patterns like "T.M. 76/20-22" or "P.M. 45/67-69"
+  // Match patterns with page ranges first (e.g., "T.M. 76/20-22")
   const withRange =
+    text.match(/R\.?\s*M\.?\s+Bk\.?\s*(\d+)\s*,?\s*Pg\.?\s*(\d+)\s*[-–]\s*(\d+)/i) ||
     text.match(/T\.?M\.?\s+(\d+)\s*[/\-]\s*(\d+)\s*[-–]\s*(\d+)/i) ||
     text.match(/P\.?M\.?\s+(\d+)\s*[/\-]\s*(\d+)\s*[-–]\s*(\d+)/i) ||
-    text.match(/[Bb]ook\s+(\d+)[,\s]+[Pp]ages?\s+(\d+)\s*[-–]\s*(\d+)/i) ||
+    text.match(/[Bb](?:oo)?k\.?\s*(\d+)[,\s]+[Pp](?:age|g)s?\.?\s*(\d+)\s*[-–]\s*(\d+)/i) ||
     text.match(/BK\s+(\d+)\s+PG\s+(\d+)\s*[-–]\s*(\d+)/i);
   if (withRange) return { book: withRange[1], page: withRange[2], endPage: withRange[3] };
 
+  // Single page patterns
   const m =
+    text.match(/R\.?\s*M\.?\s+Bk\.?\s*(\d+)\s*,?\s*Pg\.?\s*(\d+)/i) ||
     text.match(/T\.?M\.?\s+(\d+)\s*[/\-]\s*(\d+)/i) ||
     text.match(/P\.?M\.?\s+(\d+)\s*[/\-]\s*(\d+)/i) ||
-    text.match(/[Bb]ook\s+(\d+)[,\s]+[Pp]ages?\s+(\d+)/i) ||
+    text.match(/[Bb](?:oo)?k\.?\s*(\d+)[,\s]+[Pp](?:age|g)s?\.?\s*(\d+)/i) ||
     text.match(/BK\s+(\d+)\s+PG\s+(\d+)/i);
   if (!m) return null;
   return { book: m[1], page: m[2] };

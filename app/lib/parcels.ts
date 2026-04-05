@@ -2,7 +2,7 @@
  * Santa Barbara County parcel lookups.
  *
  * geocode        – address → lat/lon via Nominatim
- * getAPN         – lat/lon → APN (Goleta MAGNET, then SB City ArcGIS)
+ * getAPN         – lat/lon → APN (MAGNET → SB City ArcGIS → SB County ArcGIS)
  * apnToAssessorMapUrl – APN → assessor parcel map PDF URL
  */
 
@@ -10,6 +10,8 @@ const GOLETA_MAGNET =
   "https://goleta.magnetserver.com/core4/map";
 const SB_CITY_PARCELS =
   "https://services3.arcgis.com/hMpg7vsYb74pEKjX/arcgis/rest/services/ODS_Master_Parcel_Layer_2023_04_withR2/FeatureServer/0/query";
+const SB_COUNTY_PARCELS =
+  "https://services.arcgis.com/KkJhFbLnXVqahKz2/arcgis/rest/services/Parcel_layers_ArcGISonline_LUZO/FeatureServer/0/query";
 
 export async function geocode(
   address: string,
@@ -51,6 +53,23 @@ export async function getAPN(
   try {
     const url =
       `${SB_CITY_PARCELS}?geometry=${lon},${lat}` +
+      `&geometryType=esriGeometryPoint&inSR=4326` +
+      `&spatialRel=esriSpatialRelIntersects&outFields=APN&returnGeometry=false&f=json`;
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Vitruvius/1.0" },
+      signal: AbortSignal.timeout(10000),
+    });
+    if (resp.ok) {
+      const data = await resp.json();
+      const apn = data.features?.[0]?.attributes?.APN;
+      if (apn) return apn;
+    }
+  } catch { /* fall through */ }
+
+  // Try SB County Planning ArcGIS (covers entire county including unincorporated areas)
+  try {
+    const url =
+      `${SB_COUNTY_PARCELS}?geometry=${lon},${lat}` +
       `&geometryType=esriGeometryPoint&inSR=4326` +
       `&spatialRel=esriSpatialRelIntersects&outFields=APN&returnGeometry=false&f=json`;
     const resp = await fetch(url, {
