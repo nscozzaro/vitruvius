@@ -28,8 +28,11 @@ export async function POST(request: NextRequest) {
     const lastPage = endPage ? parseInt(endPage, 10) : startPage;
     const geometryPageNum = lastPage > startPage ? startPage + 1 : startPage;
 
+    console.log(`[generate-dxf] book=${book} page=${page} endPage=${endPage} → geometryPage=${geometryPageNum}`);
     const pdfBuf = await downloadPage(book, String(geometryPageNum));
+    console.log(`[generate-dxf] downloadPage result: ${pdfBuf ? pdfBuf.length + ' bytes' : 'null'}`);
     if (!pdfBuf) {
+      console.log(`[generate-dxf] FALLBACK to merged PDF`);
       const merged = await searchRecorder(book, page, endPage);
       if (!merged) {
         return new Response(
