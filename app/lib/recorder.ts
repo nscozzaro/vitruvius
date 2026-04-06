@@ -77,7 +77,7 @@ export async function searchRecorder(
 }
 
 /** Downloads a single page PDF from the surveyor. */
-async function downloadPage(
+export async function downloadPage(
   book: string,
   page: string,
 ): Promise<Buffer | null> {
