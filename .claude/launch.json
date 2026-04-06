@@ -4,7 +4,7 @@
     {
       "name": "next-dev",
       "runtimeExecutable": "/usr/bin/env",
-      "runtimeArgs": ["-S", "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "node", "/Users/genevievefox/Documents/Nic/vitruvius/node_modules/.bin/next", "dev"],
+      "runtimeArgs": ["-S", "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "npm", "run", "dev"],
       "port": 3000
     }
   ]
