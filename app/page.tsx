@@ -202,6 +202,7 @@ export default function Home() {
                     }
                     pdfUrl={state.tractMapUrl}
                     icon="survey"
+                    tractInfo={state.tractInfo}
                   />
                 )}
               </div>
@@ -225,20 +226,61 @@ function MapCard({
   description,
   pdfUrl,
   icon,
+  tractInfo,
 }: {
   title: string;
   description: string;
   pdfUrl: string;
   icon: "parcel" | "survey";
+  tractInfo?: TractInfo | null;
 }) {
+  const [dxfLoading, setDxfLoading] = useState(false);
+
+  const handleDxfDownload = async (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (!tractInfo || dxfLoading) return;
+
+    setDxfLoading(true);
+    try {
+      const resp = await fetch("/api/generate-dxf", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          book: tractInfo.book,
+          page: tractInfo.page,
+          endPage: tractInfo.endPage,
+        }),
+      });
+
+      if (!resp.ok) {
+        const err = await resp.json().catch(() => ({ error: "Download failed" }));
+        alert(err.error || "DXF generation failed");
+        return;
+      }
+
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `site-plan-bk${tractInfo.book}-pg${tractInfo.page}.dxf`;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      alert(err instanceof Error ? err.message : "DXF download failed");
+    } finally {
+      setDxfLoading(false);
+    }
+  };
+
   return (
-    <a
-      href={pdfUrl}
-      target="_blank"
-      rel="noopener noreferrer"
-      className="group flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white transition-all hover:border-zinc-400 hover:shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500"
-    >
-      <div className="relative flex h-48 items-center justify-center bg-zinc-50 dark:bg-zinc-800">
+    <div className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white transition-all hover:border-zinc-400 hover:shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500">
+      <a
+        href={pdfUrl}
+        target="_blank"
+        rel="noopener noreferrer"
+        className="group relative flex h-48 items-center justify-center bg-zinc-50 dark:bg-zinc-800"
+      >
         {icon === "parcel" ? (
           <svg
             className="h-16 w-16 text-zinc-300 dark:text-zinc-600"
@@ -286,7 +328,7 @@ function MapCard({
             </svg>
           </span>
         </div>
-      </div>
+      </a>
       <div className="border-t border-zinc-100 px-4 py-3 dark:border-zinc-800">
         <h3 className="text-sm font-semibold text-zinc-900 dark:text-zinc-100">
           {title}
@@ -294,7 +336,28 @@ function MapCard({
         <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           {description}
         </p>
+        {tractInfo && (
+          <button
+            onClick={handleDxfDownload}
+            disabled={dxfLoading}
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+          >
+            {dxfLoading ? (
+              <>
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
+                Generating DXF…
+              </>
+            ) : (
+              <>
+                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                </svg>
+                Download DXF Site Plan
+              </>
+            )}
+          </button>
+        )}
       </div>
-    </a>
+    </div>
   );
 }
