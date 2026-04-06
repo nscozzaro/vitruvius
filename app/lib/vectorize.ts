@@ -99,7 +99,6 @@ export async function applyMask(
  * Vectorize a PNG image using potrace.
  */
 export async function vectorize(pngBase64: string): Promise<TracedPath[]> {
-  const potrace = await import("potrace");
   const pngBuf = Buffer.from(pngBase64, "base64");
 
   const id = Math.random().toString(36).slice(2);
@@ -107,11 +106,24 @@ export async function vectorize(pngBase64: string): Promise<TracedPath[]> {
   await writeFile(pngPath, pngBuf);
 
   try {
-    const svg = await new Promise<string>((resolve, reject) => {
-      potrace.trace(pngPath, { threshold: 128, turdSize: 2, optCurve: true },
-        (err: Error | null, svg: string) => err ? reject(err) : resolve(svg));
+    // potrace module has compatibility issues with Turbopack's require/import
+    // Use dynamic require with explicit default handling
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const potraceModule = require("potrace");
+    const traceFn = potraceModule.trace || potraceModule.default?.trace;
+    if (!traceFn) {
+      console.error("[vectorize] potrace.trace not found. Keys:", Object.keys(potraceModule));
+      return [];
+    }
+
+    const svg: string = await new Promise((resolve, reject) => {
+      traceFn(pngPath, { threshold: 128, turdSize: 2, optCurve: true },
+        (err: Error | null, result: string) => err ? reject(err) : resolve(result));
     });
     return parseSvgPaths(svg);
+  } catch (err) {
+    console.error("[vectorize] potrace error:", err);
+    return [];
   } finally {
     await unlink(pngPath).catch(() => {});
   }

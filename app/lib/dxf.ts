@@ -67,25 +67,20 @@ export function generateDxf(
   const scale = parseScale(metadata.scale);
   // scale = feet per pixel
 
-  // Track which traced paths have been "consumed" (matched to computed geometry)
-  const consumed = new Set<number>();
-
   // ── Compute and draw lot geometry ──────────────────────────────────
 
   const lotGeometries = new Map<string, TraversedSegment[]>();
 
-  for (const lot of geometry.lots) {
-    const calls = boundariesToCalls(lot.boundaries);
+  for (const lot of (geometry.lots || [])) {
+    try {
+    const calls = boundariesToCalls(lot.boundaries || []);
     if (calls.length === 0) continue;
 
+    // Each lot starts at origin — we don't have enough spatial data
+    // from the AI to position lots relative to each other correctly
     const segments = traverseSurveyCalls(calls);
     if (segments.length === 0) continue;
     lotGeometries.set(lot.number, segments);
-
-    // Mark nearby traces as consumed
-    for (const seg of segments) {
-      consumeNearbyTraces(traces, seg, scale, consumed);
-    }
 
     // Draw lot boundary on LOT layer
     dxf.setCurrentLayerName(LAYERS.LOT.name);
@@ -136,15 +131,17 @@ export function generateDxf(
     const centroid = computeCentroid(segments);
     dxf.addText(v3(centroid.x, centroid.y), LABEL_TEXT_HEIGHT, lot.number);
 
-    // Consume traced text near lot center (lot number characters)
-    consumeNearCenter(traces, centroid, 15 * scale, consumed);
+    } catch (err) {
+      console.error(`[dxf] Error processing lot ${lot.number}:`, err);
+    }
   }
 
   // ── Easements ──────────────────────────────────────────────────────
 
   dxf.setCurrentLayerName(LAYERS.EASEMENTS.name);
   for (const easement of geometry.easements) {
-    for (const lotNum of easement.lots) {
+    const lots = Array.isArray(easement.lots) ? easement.lots : [];
+    for (const lotNum of lots) {
       const segments = lotGeometries.get(lotNum);
       if (!segments) continue;
 
@@ -173,13 +170,11 @@ export function generateDxf(
   // ── Monuments ──────────────────────────────────────────────────────
 
   dxf.setCurrentLayerName(LAYERS.MONUMENTS.name);
-  for (const monument of geometry.monuments) {
+  for (const monument of (geometry.monuments || [])) {
     const pos = findMonumentPosition(monument, lotGeometries, geometry.lots);
     if (!pos) continue;
 
     dxf.addCircle(v3(pos.x, pos.y), MONUMENT_RADIUS);
-    consumeNearCenter(traces, pos, 8 * scale, consumed);
-
     if (monument.description) {
       dxf.addText(
         v3(pos.x + MONUMENT_RADIUS * 2, pos.y + MONUMENT_RADIUS),
@@ -192,7 +187,7 @@ export function generateDxf(
   // ── Street names ───────────────────────────────────────────────────
 
   dxf.setCurrentLayerName(LAYERS.LABELS.name);
-  for (const street of geometry.streets) {
+  for (const street of (geometry.streets || [])) {
     dxf.addText(v3(0, -20), LABEL_TEXT_HEIGHT, street.name);
     if (street.width_ft) {
       dxf.addText(v3(0, -20 - LABEL_TEXT_HEIGHT * 1.5), DIM_TEXT_HEIGHT * 0.8,
@@ -220,16 +215,15 @@ export function generateDxf(
     metaY -= DIM_TEXT_HEIGHT * 1.2;
   }
 
-  // ── Remaining traces ───────────────────────────────────────────────
+  // ── Vectorized traces ───────────────────────────────────────────────
+  // Draw ALL traces on the TRACE layer as-is (image coordinates scaled to feet).
+  // These provide the visual baseline of the scanned map.
 
   dxf.setCurrentLayerName(LAYERS.TRACE.name);
-  for (let i = 0; i < traces.length; i++) {
-    if (consumed.has(i)) continue;
-    const path = traces[i];
-    // Draw traced path as polyline (convert from image coords to document coords)
+  for (const path of traces) {
     const pts = path.points.map((p) => ({
       x: p.x * scale,
-      y: (imageHeight - p.y) * scale, // flip Y (image Y is top-down, DXF is bottom-up)
+      y: (imageHeight - p.y) * scale,
     }));
 
     if (pts.length >= 2) {
@@ -261,49 +255,6 @@ function boundariesToCalls(boundaries: Stage2Result["lots"][0]["boundaries"]): S
     }
   }
   return calls;
-}
-
-/**
- * Mark traced paths near a computed segment as consumed.
- */
-function consumeNearbyTraces(
-  traces: TracedPath[],
-  segment: TraversedSegment,
-  scale: number,
-  consumed: Set<number>,
-  threshold = 15,
-): void {
-  // Convert computed segment to image coords for comparison
-  const sx = segment.midpoint.x / scale;
-  const sy = segment.midpoint.y / scale;
-
-  for (let i = 0; i < traces.length; i++) {
-    if (consumed.has(i)) continue;
-    const t = traces[i];
-    const dx = t.centroid.x - sx;
-    const dy = t.centroid.y - sy;
-    const dist = Math.sqrt(dx * dx + dy * dy);
-    if (dist < threshold / scale) {
-      consumed.add(i);
-    }
-  }
-}
-
-function consumeNearCenter(
-  traces: TracedPath[],
-  center: Point,
-  radius: number,
-  consumed: Set<number>,
-): void {
-  for (let i = 0; i < traces.length; i++) {
-    if (consumed.has(i)) continue;
-    const t = traces[i];
-    const dx = t.centroid.x - center.x;
-    const dy = t.centroid.y - center.y;
-    if (Math.sqrt(dx * dx + dy * dy) < radius) {
-      consumed.add(i);
-    }
-  }
 }
 
 function computeCentroid(segments: TraversedSegment[]): Point {
