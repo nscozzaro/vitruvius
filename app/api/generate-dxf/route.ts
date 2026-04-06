@@ -1,25 +1,17 @@
 import { NextRequest } from "next/server";
-import { downloadPage } from "@/app/lib/recorder";
-import { renderPdfToPng, applyMask, vectorize } from "@/app/lib/vectorize";
-import {
-  analyzeStage1, analyzeStage2,
-  type Stage1Result, type Stage2Result, type MapMetadata,
-} from "@/app/lib/map-analyzer";
-import { generateDxf } from "@/app/lib/dxf";
+import { downloadPage, searchRecorder } from "@/app/lib/recorder";
+import { renderPdfToPng, vectorize } from "@/app/lib/vectorize";
 import type { TracedPath } from "@/app/lib/vectorize";
+import { DxfWriter, Units } from "@tarikjabiri/dxf";
 
 /**
  * POST /api/generate-dxf
  *
- * Generates a DXF site plan from a county surveyor map.
- *
- * For multi-page maps (e.g., pages 20-22), the first page is typically
- * the title/certification page. We download individual pages and process
- * the SECOND page (the lot geometry sheet) for vectorization and AI analysis.
- * The title page is used only for metadata extraction.
+ * Simple PDF → PNG → potrace → DXF conversion.
+ * No AI — just vectorize the map and output clean DXF geometry.
  */
 
-export const maxDuration = 120;
+export const maxDuration = 60;
 
 export async function POST(request: NextRequest) {
   try {
@@ -32,112 +24,109 @@ export async function POST(request: NextRequest) {
       });
     }
 
-    // Determine which page has the lot geometry
-    // For multi-page maps: page 1 = title, page 2+ = geometry
-    // For single-page maps: that page IS the geometry
+    // For multi-page maps, process the geometry page (page 2)
     const startPage = parseInt(page, 10);
     const lastPage = endPage ? parseInt(endPage, 10) : startPage;
-    const isMultiPage = lastPage > startPage;
+    const geometryPageNum = lastPage > startPage ? startPage + 1 : startPage;
 
-    // The geometry page is page 2 for multi-page maps, page 1 for single-page
-    const geometryPageNum = isMultiPage ? startPage + 1 : startPage;
-    const titlePageNum = isMultiPage ? startPage : null;
-
-    // Step 1: Download the geometry page
-    const geometryPdf = await downloadPage(book, String(geometryPageNum));
-    if (!geometryPdf) {
-      return new Response(
-        JSON.stringify({ error: `Could not download page ${geometryPageNum} from county surveyor` }),
-        { status: 404, headers: { "Content-Type": "application/json" } },
-      );
-    }
-
-    // Step 2: Render geometry page to PNG
-    const rendered = await renderPdfToPng(geometryPdf, 2048);
-
-    let metadata: MapMetadata = {
-      book,
-      pages: endPage ? `${page}-${endPage}` : page,
-    };
-    let geometry: Stage2Result = {
-      lots: [], streets: [], easements: [], monuments: [],
-    };
-    let traces: TracedPath[] = [];
-    let imgWidth = 1396;
-    let imgHeight = 2048;
-
-    if (rendered) {
-      imgWidth = rendered.width;
-      imgHeight = rendered.height;
-
-      // Step 3: If there's a separate title page, extract metadata from it
-      if (titlePageNum) {
-        try {
-          const titlePdf = await downloadPage(book, String(titlePageNum));
-          if (titlePdf) {
-            const titleRendered = await renderPdfToPng(titlePdf, 2048);
-            if (titleRendered) {
-              const stage1 = await analyzeStage1(titleRendered.base64);
-              metadata = { ...metadata, ...stage1.metadata };
-            }
-          }
-        } catch (err) {
-          console.error("[generate-dxf] Title page metadata error:", err);
-        }
-      }
-
-      // Step 4: Mask and vectorize the GEOMETRY page
-      let stage1Geometry: Stage1Result = { metadata: {}, mask_regions: [] };
-      try {
-        stage1Geometry = await analyzeStage1(rendered.base64);
-        // Merge any additional metadata from the geometry page
-        if (!metadata.scale && stage1Geometry.metadata.scale) {
-          metadata.scale = stage1Geometry.metadata.scale;
-        }
-      } catch (err) {
-        console.error("[generate-dxf] Stage 1 AI error:", err);
-      }
-
-      try {
-        const maskedBase64 = await applyMask(
-          rendered.base64, rendered.width, rendered.height, stage1Geometry.mask_regions,
+    // Download the geometry page
+    const pdfBuf = await downloadPage(book, String(geometryPageNum));
+    if (!pdfBuf) {
+      // Fallback: try merged PDF
+      const merged = await searchRecorder(book, page, endPage);
+      if (!merged) {
+        return new Response(
+          JSON.stringify({ error: "Could not download map" }),
+          { status: 404, headers: { "Content-Type": "application/json" } },
         );
-        traces = await vectorize(maskedBase64);
-      } catch (err) {
-        console.error("[generate-dxf] Vectorize error:", err);
       }
-
-      // Step 5: Extract geometry from the lot layout page
-      try {
-        geometry = await analyzeStage2(rendered.base64);
-      } catch (err) {
-        console.error("[generate-dxf] Stage 2 AI error:", err);
-      }
-    } else {
-      console.warn("[generate-dxf] PDF rendering failed — geometry-only DXF");
+      return await generateFromPdf(merged, book, page, endPage);
     }
 
-    // Step 6: Generate DXF
-    const dxfContent = generateDxf(traces, geometry, metadata, imgWidth, imgHeight);
-
-    const filename = endPage
-      ? `site-plan-bk${book}-pg${page}-${endPage}.dxf`
-      : `site-plan-bk${book}-pg${page}.dxf`;
-
-    return new Response(dxfContent, {
-      headers: {
-        "Content-Type": "application/dxf",
-        "Content-Disposition": `attachment; filename="${filename}"`,
-        "Cache-Control": "public, max-age=3600",
-      },
-    });
+    return await generateFromPdf(pdfBuf, book, page, endPage);
   } catch (err) {
     console.error("[generate-dxf] Error:", err);
     return new Response(
-      JSON.stringify({
-        error: err instanceof Error ? err.message : "DXF generation failed",
-      }),
+      JSON.stringify({ error: err instanceof Error ? err.message : "DXF generation failed" }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
+}
+
+async function generateFromPdf(
+  pdfBuf: Buffer,
+  book: string,
+  page: string,
+  endPage?: string,
+): Promise<Response> {
+  // Render to PNG
+  const rendered = await renderPdfToPng(pdfBuf, 2048);
+  if (!rendered) {
+    return new Response(
+      JSON.stringify({ error: "Could not render PDF to image" }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  // Vectorize
+  const traces = await vectorize(rendered.base64);
+  if (traces.length === 0) {
+    return new Response(
+      JSON.stringify({ error: "Vectorization produced no paths" }),
+      { status: 500, headers: { "Content-Type": "application/json" } },
+    );
+  }
+
+  // Convert to DXF
+  const dxfContent = tracesToDxf(traces, rendered.width, rendered.height);
+
+  const filename = endPage
+    ? `site-plan-bk${book}-pg${page}-${endPage}.dxf`
+    : `site-plan-bk${book}-pg${page}.dxf`;
+
+  return new Response(dxfContent, {
+    headers: {
+      "Content-Type": "application/dxf",
+      "Content-Disposition": `attachment; filename="${filename}"`,
+      "Cache-Control": "public, max-age=3600",
+    },
+  });
+}
+
+/**
+ * Convert potrace paths to a DXF file.
+ * Coordinates are in the PDF's native units (points, 1/72 inch).
+ */
+function tracesToDxf(
+  traces: TracedPath[],
+  imageWidth: number,
+  imageHeight: number,
+): string {
+  const dxf = new DxfWriter();
+  dxf.setUnits(Units.Inches);
+
+  dxf.addLayer("0", 7, "CONTINUOUS");
+
+  dxf.setCurrentLayerName("0");
+
+  // Convert image pixel coords to inches (assuming ~150 DPI effective)
+  // The PDF was rendered at "scale-to 2048", so we need to map back
+  // to the original document size. Typical tract maps are ~18"x24" or ~24"x36".
+  // At 2048px on the long side, scale = 2048 / (longSide * 72) where 72 = points/inch
+  // We don't know the exact DPI, so use pixels directly — the user can scale in CAD.
+  // Just flip Y so it's right-side up.
+
+  for (const path of traces) {
+    const pts = path.points;
+    if (pts.length < 2) continue;
+
+    for (let i = 0; i < pts.length - 1; i++) {
+      dxf.addLine(
+        { x: pts[i].x, y: imageHeight - pts[i].y, z: 0 },
+        { x: pts[i + 1].x, y: imageHeight - pts[i + 1].y, z: 0 },
+      );
+    }
+  }
+
+  return dxf.stringify();
 }
