@@ -1,6 +1,6 @@
 "use client";
 
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import AddressInput from "@/app/components/AddressInput";
 
 type Step = { message: string; done: boolean };
@@ -27,7 +27,39 @@ type ResultState =
 
 export default function Home() {
   const [state, setState] = useState<ResultState>({ status: "idle" });
+  const [dxfUrl, setDxfUrl] = useState<string | null>(null);
+  const [dxfLoading, setDxfLoading] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
+
+  // Auto-generate DXF when tract map results arrive
+  useEffect(() => {
+    if (state.status !== "done" || !state.tractInfo) {
+      setDxfUrl(null);
+      setDxfLoading(false);
+      return;
+    }
+
+    const info = state.tractInfo;
+    setDxfLoading(true);
+    setDxfUrl(null);
+
+    const ctrl = new AbortController();
+    fetch("/api/generate-dxf", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ book: info.book, page: info.page, endPage: info.endPage }),
+      signal: ctrl.signal,
+    })
+      .then(async (resp) => {
+        if (!resp.ok) return;
+        const blob = await resp.blob();
+        setDxfUrl(URL.createObjectURL(blob));
+      })
+      .catch(() => {})
+      .finally(() => setDxfLoading(false));
+
+    return () => ctrl.abort();
+  }, [state]);
 
   const handleSubmit = async (address: string) => {
     abortRef.current?.abort();
@@ -202,7 +234,9 @@ export default function Home() {
                     }
                     pdfUrl={state.tractMapUrl}
                     icon="survey"
-                    tractInfo={state.tractInfo}
+                    dxfUrl={dxfUrl}
+                    dxfLoading={dxfLoading}
+                    dxfFilename={state.tractInfo ? `site-plan-bk${state.tractInfo.book}-pg${state.tractInfo.page}.dxf` : undefined}
                   />
                 )}
               </div>
@@ -226,53 +260,18 @@ function MapCard({
   description,
   pdfUrl,
   icon,
-  tractInfo,
+  dxfUrl,
+  dxfLoading,
+  dxfFilename,
 }: {
   title: string;
   description: string;
   pdfUrl: string;
   icon: "parcel" | "survey";
-  tractInfo?: TractInfo | null;
+  dxfUrl?: string | null;
+  dxfLoading?: boolean;
+  dxfFilename?: string;
 }) {
-  const [dxfLoading, setDxfLoading] = useState(false);
-
-  const handleDxfDownload = async (e: React.MouseEvent) => {
-    e.preventDefault();
-    e.stopPropagation();
-    if (!tractInfo || dxfLoading) return;
-
-    setDxfLoading(true);
-    try {
-      const resp = await fetch("/api/generate-dxf", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          book: tractInfo.book,
-          page: tractInfo.page,
-          endPage: tractInfo.endPage,
-        }),
-      });
-
-      if (!resp.ok) {
-        const err = await resp.json().catch(() => ({ error: "Download failed" }));
-        alert(err.error || "DXF generation failed");
-        return;
-      }
-
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = url;
-      a.download = `site-plan-bk${tractInfo.book}-pg${tractInfo.page}.dxf`;
-      a.click();
-      URL.revokeObjectURL(url);
-    } catch (err) {
-      alert(err instanceof Error ? err.message : "DXF download failed");
-    } finally {
-      setDxfLoading(false);
-    }
-  };
-
   return (
     <div className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white transition-all hover:border-zinc-400 hover:shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500">
       <a
@@ -336,16 +335,21 @@ function MapCard({
         <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           {description}
         </p>
-        {tractInfo && (
-          <button
-            onClick={handleDxfDownload}
-            disabled={dxfLoading}
-            className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-zinc-200 bg-zinc-50 px-3 py-1.5 text-xs font-medium text-zinc-700 transition-colors hover:bg-zinc-100 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-300 dark:hover:bg-zinc-700"
+        {(dxfUrl || dxfLoading) && (
+          <a
+            href={dxfUrl || "#"}
+            download={dxfFilename || "site-plan.dxf"}
+            onClick={(e) => { if (!dxfUrl) e.preventDefault(); }}
+            className={`mt-2 flex w-full items-center justify-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
+              dxfUrl
+                ? "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300 dark:hover:bg-blue-900/50"
+                : "border-zinc-200 bg-zinc-50 text-zinc-400 cursor-wait dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-500"
+            }`}
           >
             {dxfLoading ? (
               <>
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
-                Generating DXF…
+                <span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
+                Preparing DXF…
               </>
             ) : (
               <>
@@ -355,7 +359,7 @@ function MapCard({
                 Download DXF Site Plan
               </>
             )}
-          </button>
+          </a>
         )}
       </div>
     </div>
