@@ -14,6 +14,17 @@ export interface TracedChain {
   points: Array<{ x: number; y: number }>;
 }
 
+export interface Monument {
+  cx: number;
+  cy: number;
+  radius: number;
+}
+
+export interface VectorizeResult {
+  chains: TracedChain[];
+  monuments: Monument[];
+}
+
 /**
  * Render a PDF to PNG. Uses mupdf (WASM, works everywhere including Vercel).
  */
@@ -49,9 +60,10 @@ export async function renderPdfToPng(
 
 /**
  * Vectorize a PNG using skeletonization + chain following.
- * Produces clean single-line polylines (not outline traces).
+ * Detects monuments (filled circles) before skeletonization,
+ * then produces clean single-line polylines.
  */
-export async function vectorize(pngBase64: string): Promise<TracedChain[]> {
+export async function vectorize(pngBase64: string): Promise<VectorizeResult> {
   const sharp = (await import("sharp")).default;
   const pngBuf = Buffer.from(pngBase64, "base64");
 
@@ -71,18 +83,132 @@ export async function vectorize(pngBase64: string): Promise<TracedChain[]> {
     bin[i] = data[i] === 0 ? 1 : 0;
   }
 
+  // Detect monuments BEFORE skeletonization (which would destroy filled circles)
+  const monuments = detectMonuments(bin, w, h);
+
   // Zhang-Suen thinning → 1px skeleton
   skeletonize(bin, w, h);
 
   // Chain following → polylines
-  const chains = followChains(bin, w, h);
+  const rawChains = followChains(bin, w, h);
 
-  // Douglas-Peucker simplification
-  return chains
+  // Douglas-Peucker simplification + Y-flip
+  const chains = rawChains
     .map((chain) => ({
       points: simplify(chain, 0.8).map(([x, y]) => ({ x, y: h - y })),
     }))
     .filter((c) => c.points.length >= 2);
+
+  return { chains, monuments };
+}
+
+// ── Monument detection ───────────────────────────────────────────────
+
+/**
+ * Detect filled circle monuments using connected component labeling.
+ * Runs on the binary image BEFORE skeletonization.
+ * Erases detected monuments from the binary so they don't create
+ * noise in the skeleton.
+ */
+function detectMonuments(bin: Uint8Array, w: number, h: number): Monument[] {
+  const labels = new Int32Array(w * h);
+  let nextLabel = 1;
+
+  interface Component {
+    label: number;
+    area: number;
+    sumX: number;
+    sumY: number;
+    minX: number; maxX: number;
+    minY: number; maxY: number;
+    perim: number;
+    pixels: number[];
+  }
+
+  const components: Component[] = [];
+
+  // BFS flood-fill to find connected components
+  for (let y = 0; y < h; y++) {
+    for (let x = 0; x < w; x++) {
+      if (!bin[y * w + x] || labels[y * w + x]) continue;
+
+      const label = nextLabel++;
+      const queue: number[][] = [[x, y]];
+      labels[y * w + x] = label;
+      const comp: Component = {
+        label, area: 0, sumX: 0, sumY: 0,
+        minX: x, maxX: x, minY: y, maxY: y,
+        perim: 0, pixels: [],
+      };
+
+      while (queue.length) {
+        const [cx, cy] = queue.shift()!;
+        comp.area++;
+        comp.sumX += cx;
+        comp.sumY += cy;
+        comp.pixels.push(cy * w + cx);
+        if (cx < comp.minX) comp.minX = cx;
+        if (cx > comp.maxX) comp.maxX = cx;
+        if (cy < comp.minY) comp.minY = cy;
+        if (cy > comp.maxY) comp.maxY = cy;
+
+        let isBorder = false;
+        for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
+          const nx = cx + dx, ny = cy + dy;
+          if (nx < 0 || nx >= w || ny < 0 || ny >= h || !bin[ny * w + nx]) {
+            isBorder = true;
+            continue;
+          }
+          if (!labels[ny * w + nx]) {
+            labels[ny * w + nx] = label;
+            queue.push([nx, ny]);
+          }
+        }
+        if (isBorder) comp.perim++;
+      }
+
+      // Only consider small-to-medium components (skip large line networks)
+      if (comp.area <= 500) {
+        components.push(comp);
+      }
+    }
+  }
+
+  // Filter for monuments: circular, right size, right aspect ratio
+  const monuments: Monument[] = [];
+
+  for (const comp of components) {
+    const bw = comp.maxX - comp.minX + 1;
+    const bh = comp.maxY - comp.minY + 1;
+    const aspect = Math.max(bw / bh, bh / bw);
+    const circularity = comp.perim > 0
+      ? (4 * Math.PI * comp.area) / (comp.perim * comp.perim)
+      : 0;
+
+    if (
+      comp.area >= 80 &&
+      comp.area <= 300 &&
+      circularity > 0.75 &&
+      aspect < 1.3
+    ) {
+      const cx = comp.sumX / comp.area;
+      const cy = comp.sumY / comp.area;
+      const radius = Math.sqrt((4 * comp.area) / Math.PI) / 2;
+
+      monuments.push({
+        cx,
+        cy: h - cy,  // Y-flip to match DXF coordinate system
+        radius,
+      });
+
+      // Erase monument pixels from binary so they don't affect skeletonization
+      for (const idx of comp.pixels) {
+        bin[idx] = 0;
+      }
+    }
+  }
+
+  return monuments;
 }
 
 // ── Zhang-Suen thinning ──────────────────────────────────────────────

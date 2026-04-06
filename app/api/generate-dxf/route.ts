@@ -2,7 +2,7 @@ import { NextRequest } from "next/server";
 import { downloadPage, searchRecorder } from "@/app/lib/recorder";
 import { renderPdfToPng, vectorize } from "@/app/lib/vectorize";
 import { DxfWriter, Units } from "@tarikjabiri/dxf";
-import type { TracedChain } from "@/app/lib/vectorize";
+import type { TracedChain, Monument } from "@/app/lib/vectorize";
 
 /**
  * POST /api/generate-dxf
@@ -64,7 +64,7 @@ async function generateFromPdf(
     );
   }
 
-  const chains = await vectorize(rendered.base64);
+  const { chains, monuments } = await vectorize(rendered.base64);
   if (chains.length === 0) {
     return new Response(
       JSON.stringify({ error: "Vectorization produced no paths" }),
@@ -72,7 +72,7 @@ async function generateFromPdf(
     );
   }
 
-  const dxfContent = chainsToDxf(chains);
+  const dxfContent = chainsToDxf(chains, monuments);
 
   const filename = endPage
     ? `site-plan-bk${book}-pg${page}-${endPage}.dxf`
@@ -87,12 +87,15 @@ async function generateFromPdf(
   });
 }
 
-function chainsToDxf(chains: TracedChain[]): string {
+function chainsToDxf(chains: TracedChain[], monuments: Monument[]): string {
   const dxf = new DxfWriter();
   dxf.setUnits(Units.Unitless);
-  dxf.addLayer("0", 7, "CONTINUOUS");
-  dxf.setCurrentLayerName("0");
 
+  dxf.addLayer("0", 7, "CONTINUOUS");
+  dxf.addLayer("MONUMENTS", 1, "CONTINUOUS"); // color 1 = red
+
+  // Draw vectorized line traces
+  dxf.setCurrentLayerName("0");
   for (const chain of chains) {
     const pts = chain.points;
     for (let i = 0; i < pts.length - 1; i++) {
@@ -101,6 +104,12 @@ function chainsToDxf(chains: TracedChain[]): string {
         { x: pts[i + 1].x, y: pts[i + 1].y, z: 0 },
       );
     }
+  }
+
+  // Draw detected monuments as circles
+  dxf.setCurrentLayerName("MONUMENTS");
+  for (const m of monuments) {
+    dxf.addCircle({ x: m.cx, y: m.cy, z: 0 }, m.radius);
   }
 
   return dxf.stringify();
