@@ -1,43 +1,43 @@
 /**
- * PDF → PNG → Skeletonize → Chain-follow → DXF pipeline.
+ * PDF → PNG → Potrace → DXF pipeline.
  *
- * Uses Zhang-Suen thinning to reduce all strokes to 1px centerlines,
- * then follows connected pixel chains to produce clean polylines.
- * Douglas-Peucker simplification reduces point count.
+ * Renders PDF at 300 DPI via mupdf, then vectorizes with potrace.
+ * Potrace traces outlines of ink regions, preserving filled shapes
+ * (monuments, thick lines) that skeletonization would destroy.
  */
 
 import { tmpdir } from "os";
 import { join } from "path";
 import { writeFile, unlink } from "fs/promises";
 
-export interface TracedChain {
+export interface TracedPath {
+  /** SVG path d attribute for this subpath */
+  d: string;
+  /** Extracted coordinate points */
   points: Array<{ x: number; y: number }>;
 }
 
-export interface Monument {
-  cx: number;
-  cy: number;
-  radius: number;
-}
-
 export interface VectorizeResult {
-  chains: TracedChain[];
-  monuments: Monument[];
+  paths: TracedPath[];
+  width: number;
+  height: number;
 }
 
 /**
- * Render a PDF to PNG. Uses mupdf (WASM, works everywhere including Vercel).
+ * Render a specific page of a PDF to PNG via mupdf WASM.
+ * Returns base64 PNG + dimensions.
  */
 export async function renderPdfToPng(
   pdfBuf: Buffer,
+  pageIndex = 0,
+  dpi = 300,
 ): Promise<{ base64: string; width: number; height: number } | null> {
   try {
     const mupdf = await import("mupdf");
     const doc = mupdf.Document.openDocument(pdfBuf, "application/pdf");
-    const page = doc.loadPage(0);
+    const page = doc.loadPage(pageIndex);
 
-    // Render at 300 DPI — balances detail vs processing time on serverless
-    const scale = 300 / 72;
+    const scale = dpi / 72;
     const pixmap = page.toPixmap(
       [scale, 0, 0, scale, 0, 0],
       mupdf.ColorSpace.DeviceGray,
@@ -53,325 +53,84 @@ export async function renderPdfToPng(
       height,
     };
   } catch (err) {
-    console.error("[renderPdfToPng] mupdf error:", err);
+    console.error("[renderPdfToPng] error:", err);
     return null;
   }
 }
 
 /**
- * Vectorize a PNG using skeletonization + chain following.
- * Detects monuments (filled circles) before skeletonization,
- * then produces clean single-line polylines.
+ * Vectorize a PNG using potrace.
+ * Returns SVG subpaths with coordinate points + image dimensions.
  */
-export async function vectorize(pngBase64: string): Promise<VectorizeResult> {
-  const sharp = (await import("sharp")).default;
+export async function vectorize(
+  pngBase64: string,
+  imageWidth: number,
+  imageHeight: number,
+): Promise<VectorizeResult> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const potrace = require("potrace");
   const pngBuf = Buffer.from(pngBase64, "base64");
 
-  // Convert to greyscale binary
-  const { data, info } = await sharp(pngBuf)
-    .greyscale()
-    .threshold(128)
-    .raw()
-    .toBuffer({ resolveWithObject: true });
+  const id = Math.random().toString(36).slice(2);
+  const pngPath = join(tmpdir(), `trace-${id}.png`);
+  await writeFile(pngPath, pngBuf);
 
-  const w = info.width;
-  const h = info.height;
+  try {
+    const svg: string = await new Promise((resolve, reject) => {
+      potrace.trace(
+        pngPath,
+        { threshold: 128, turdSize: 5, optCurve: true },
+        (err: Error | null, result: string) =>
+          err ? reject(err) : resolve(result),
+      );
+    });
 
-  // Binary: 1 = foreground (ink), 0 = background
-  const bin = new Uint8Array(w * h);
-  for (let i = 0; i < data.length; i++) {
-    bin[i] = data[i] === 0 ? 1 : 0;
+    const paths = parseSvgPaths(svg, imageHeight);
+    return { paths, width: imageWidth, height: imageHeight };
+  } finally {
+    await unlink(pngPath).catch(() => {});
   }
-
-  // Detect monuments BEFORE skeletonization (which would destroy filled circles)
-  const monuments = detectMonuments(bin, w, h);
-
-  // Zhang-Suen thinning → 1px skeleton
-  skeletonize(bin, w, h);
-
-  // Chain following → polylines
-  const rawChains = followChains(bin, w, h);
-
-  // Douglas-Peucker simplification + Y-flip
-  const chains = rawChains
-    .map((chain) => ({
-      points: simplify(chain, 0.8).map(([x, y]) => ({ x, y: h - y })),
-    }))
-    .filter((c) => c.points.length >= 2);
-
-  return { chains, monuments };
 }
-
-// ── Monument detection ───────────────────────────────────────────────
 
 /**
- * Detect filled circle monuments using connected component labeling.
- * Runs on the binary image BEFORE skeletonization.
- * Erases detected monuments from the binary so they don't create
- * noise in the skeleton.
+ * Parse potrace SVG output into individual subpaths with points.
+ * Extracts coordinate pairs from M/L/C commands.
+ * Y-flips coordinates so origin is bottom-left (DXF convention).
  */
-function detectMonuments(bin: Uint8Array, w: number, h: number): Monument[] {
-  const labels = new Int32Array(w * h);
-  let nextLabel = 1;
+function parseSvgPaths(svg: string, imageHeight: number): TracedPath[] {
+  const dMatch = svg.match(/d="([^"]+)"/);
+  if (!dMatch) return [];
 
-  interface Component {
-    label: number;
-    area: number;
-    sumX: number;
-    sumY: number;
-    minX: number; maxX: number;
-    minY: number; maxY: number;
-    perim: number;
-    pixels: number[];
-  }
+  const subpaths = dMatch[1].split(/(?=M\s)/).filter((s) => s.trim());
+  const paths: TracedPath[] = [];
 
-  const components: Component[] = [];
-
-  // BFS flood-fill to find connected components
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (!bin[y * w + x] || labels[y * w + x]) continue;
-
-      const label = nextLabel++;
-      const queue: number[][] = [[x, y]];
-      labels[y * w + x] = label;
-      const comp: Component = {
-        label, area: 0, sumX: 0, sumY: 0,
-        minX: x, maxX: x, minY: y, maxY: y,
-        perim: 0, pixels: [],
-      };
-
-      while (queue.length) {
-        const [cx, cy] = queue.shift()!;
-        comp.area++;
-        comp.sumX += cx;
-        comp.sumY += cy;
-        comp.pixels.push(cy * w + cx);
-        if (cx < comp.minX) comp.minX = cx;
-        if (cx > comp.maxX) comp.maxX = cx;
-        if (cy < comp.minY) comp.minY = cy;
-        if (cy > comp.maxY) comp.maxY = cy;
-
-        let isBorder = false;
-        for (const [dx, dy] of [[-1, 0], [1, 0], [0, -1], [0, 1]]) {
-          const nx = cx + dx, ny = cy + dy;
-          if (nx < 0 || nx >= w || ny < 0 || ny >= h || !bin[ny * w + nx]) {
-            isBorder = true;
-            continue;
-          }
-          if (!labels[ny * w + nx]) {
-            labels[ny * w + nx] = label;
-            queue.push([nx, ny]);
-          }
-        }
-        if (isBorder) comp.perim++;
-      }
-
-      // Only consider small-to-medium components (skip large line networks)
-      if (comp.area <= 500) {
-        components.push(comp);
-      }
+  for (const sp of subpaths) {
+    const points = extractPoints(sp, imageHeight);
+    if (points.length >= 2) {
+      paths.push({ d: sp, points });
     }
   }
 
-  // Filter for monuments: circular, right size, right aspect ratio
-  const monuments: Monument[] = [];
-
-  for (const comp of components) {
-    const bw = comp.maxX - comp.minX + 1;
-    const bh = comp.maxY - comp.minY + 1;
-    const aspect = Math.max(bw / bh, bh / bw);
-    const circularity = comp.perim > 0
-      ? (4 * Math.PI * comp.area) / (comp.perim * comp.perim)
-      : 0;
-
-    if (
-      comp.area >= 80 &&
-      comp.area <= 300 &&
-      circularity > 0.75 &&
-      aspect < 1.3
-    ) {
-      const cx = comp.sumX / comp.area;
-      const cy = comp.sumY / comp.area;
-      const radius = Math.sqrt((4 * comp.area) / Math.PI) / 2;
-
-      monuments.push({
-        cx,
-        cy: h - cy,  // Y-flip to match DXF coordinate system
-        radius,
-      });
-
-      // Erase monument pixels from binary so they don't affect skeletonization
-      for (const idx of comp.pixels) {
-        bin[idx] = 0;
-      }
-    }
-  }
-
-  return monuments;
+  return paths;
 }
 
-// ── Zhang-Suen thinning ──────────────────────────────────────────────
-
-function skeletonize(bin: Uint8Array, w: number, h: number): void {
-  const get = (x: number, y: number) =>
-    x >= 0 && x < w && y >= 0 && y < h ? bin[y * w + x] : 0;
-
-  let changed = true;
-  let iter = 0;
-
-  while (changed && iter < 100) {
-    changed = false;
-    iter++;
-
-    // Sub-iteration 1
-    const rem1: number[] = [];
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        if (!bin[y * w + x]) continue;
-        const p2 = get(x, y - 1), p3 = get(x + 1, y - 1), p4 = get(x + 1, y);
-        const p5 = get(x + 1, y + 1), p6 = get(x, y + 1), p7 = get(x - 1, y + 1);
-        const p8 = get(x - 1, y), p9 = get(x - 1, y - 1);
-        const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
-        if (B < 2 || B > 6) continue;
-        let A = 0;
-        if (!p2 && p3) A++; if (!p3 && p4) A++; if (!p4 && p5) A++;
-        if (!p5 && p6) A++; if (!p6 && p7) A++; if (!p7 && p8) A++;
-        if (!p8 && p9) A++; if (!p9 && p2) A++;
-        if (A !== 1) continue;
-        if (p2 * p4 * p6 !== 0) continue;
-        if (p4 * p6 * p8 !== 0) continue;
-        rem1.push(y * w + x);
-      }
-    }
-    for (const idx of rem1) { bin[idx] = 0; changed = true; }
-
-    // Sub-iteration 2
-    const rem2: number[] = [];
-    for (let y = 1; y < h - 1; y++) {
-      for (let x = 1; x < w - 1; x++) {
-        if (!bin[y * w + x]) continue;
-        const p2 = get(x, y - 1), p3 = get(x + 1, y - 1), p4 = get(x + 1, y);
-        const p5 = get(x + 1, y + 1), p6 = get(x, y + 1), p7 = get(x - 1, y + 1);
-        const p8 = get(x - 1, y), p9 = get(x - 1, y - 1);
-        const B = p2 + p3 + p4 + p5 + p6 + p7 + p8 + p9;
-        if (B < 2 || B > 6) continue;
-        let A = 0;
-        if (!p2 && p3) A++; if (!p3 && p4) A++; if (!p4 && p5) A++;
-        if (!p5 && p6) A++; if (!p6 && p7) A++; if (!p7 && p8) A++;
-        if (!p8 && p9) A++; if (!p9 && p2) A++;
-        if (A !== 1) continue;
-        if (p2 * p4 * p8 !== 0) continue;
-        if (p2 * p6 * p8 !== 0) continue;
-        rem2.push(y * w + x);
-      }
-    }
-    for (const idx of rem2) { bin[idx] = 0; changed = true; }
+/**
+ * Extract coordinate points from an SVG path data string.
+ * Handles M (moveto), L (lineto), and C (cubic bezier) commands.
+ * Flips Y axis for DXF coordinate system.
+ */
+function extractPoints(
+  d: string,
+  imageHeight: number,
+): Array<{ x: number; y: number }> {
+  const points: Array<{ x: number; y: number }> = [];
+  const regex = /([\d.]+)\s*,\s*([\d.]+)/g;
+  let m;
+  while ((m = regex.exec(d)) !== null) {
+    points.push({
+      x: parseFloat(m[1]),
+      y: imageHeight - parseFloat(m[2]),
+    });
   }
-}
-
-// ── Chain following ──────────────────────────────────────────────────
-
-function followChains(bin: Uint8Array, w: number, h: number): number[][][] {
-  const visited = new Uint8Array(w * h);
-  const chains: number[][][] = [];
-
-  function unvisitedNeighbors(x: number, y: number): number[][] {
-    const n: number[][] = [];
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        if (dx === 0 && dy === 0) continue;
-        const nx = x + dx, ny = y + dy;
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h && bin[ny * w + nx] && !visited[ny * w + nx]) {
-          n.push([nx, ny]);
-        }
-      }
-    }
-    return n;
-  }
-
-  function neighborCount(x: number, y: number): number {
-    let c = 0;
-    for (let dy = -1; dy <= 1; dy++) {
-      for (let dx = -1; dx <= 1; dx++) {
-        if (dx === 0 && dy === 0) continue;
-        const nx = x + dx, ny = y + dy;
-        if (nx >= 0 && nx < w && ny >= 0 && ny < h && bin[ny * w + nx]) c++;
-      }
-    }
-    return c;
-  }
-
-  // Start from endpoints (1 neighbor)
-  const endpoints: number[][] = [];
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (bin[y * w + x] && neighborCount(x, y) === 1) {
-        endpoints.push([x, y]);
-      }
-    }
-  }
-
-  for (const [sx, sy] of endpoints) {
-    if (visited[sy * w + sx]) continue;
-    const chain: number[][] = [[sx, sy]];
-    visited[sy * w + sx] = 1;
-    let cx = sx, cy = sy;
-    while (true) {
-      const next = unvisitedNeighbors(cx, cy);
-      if (next.length === 0) break;
-      const [nx, ny] = next[0];
-      chain.push([nx, ny]);
-      visited[ny * w + nx] = 1;
-      cx = nx; cy = ny;
-    }
-    if (chain.length >= 3) chains.push(chain);
-  }
-
-  // Remaining loops
-  for (let y = 0; y < h; y++) {
-    for (let x = 0; x < w; x++) {
-      if (!bin[y * w + x] || visited[y * w + x]) continue;
-      const chain: number[][] = [[x, y]];
-      visited[y * w + x] = 1;
-      let cx = x, cy = y;
-      while (true) {
-        const next = unvisitedNeighbors(cx, cy);
-        if (next.length === 0) break;
-        const [nx, ny] = next[0];
-        chain.push([nx, ny]);
-        visited[ny * w + nx] = 1;
-        cx = nx; cy = ny;
-      }
-      if (chain.length >= 3) chains.push(chain);
-    }
-  }
-
-  return chains;
-}
-
-// ── Douglas-Peucker simplification ───────────────────────────────────
-
-function simplify(points: number[][], epsilon: number): number[][] {
-  if (points.length <= 2) return points;
-
-  const [sx, sy] = points[0];
-  const [ex, ey] = points[points.length - 1];
-  const dx = ex - sx, dy = ey - sy;
-  const len = Math.sqrt(dx * dx + dy * dy);
-
-  let maxDist = 0, maxIdx = 0;
-  for (let i = 1; i < points.length - 1; i++) {
-    const dist = len === 0
-      ? Math.sqrt((points[i][0] - sx) ** 2 + (points[i][1] - sy) ** 2)
-      : Math.abs(dy * points[i][0] - dx * points[i][1] + ex * sy - ey * sx) / len;
-    if (dist > maxDist) { maxDist = dist; maxIdx = i; }
-  }
-
-  if (maxDist > epsilon) {
-    const left = simplify(points.slice(0, maxIdx + 1), epsilon);
-    const right = simplify(points.slice(maxIdx), epsilon);
-    return left.slice(0, -1).concat(right);
-  }
-  return [points[0], points[points.length - 1]];
+  return points;
 }

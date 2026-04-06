@@ -2,13 +2,15 @@ import { NextRequest } from "next/server";
 import { downloadPage, searchRecorder } from "@/app/lib/recorder";
 import { renderPdfToPng, vectorize } from "@/app/lib/vectorize";
 import { DxfWriter, Units } from "@tarikjabiri/dxf";
-import type { TracedChain, Monument } from "@/app/lib/vectorize";
+import type { TracedPath } from "@/app/lib/vectorize";
 
 /**
  * POST /api/generate-dxf
  *
- * PDF → PNG → Skeletonize → Chain-follow → Simplify → DXF
- * Clean single-line vectorization, no AI.
+ * PDF → PNG (300 DPI via mupdf) → Potrace → DXF
+ *
+ * Potrace at 300 DPI preserves filled shapes (monuments),
+ * readable text, and all line detail.
  */
 
 export const maxDuration = 60;
@@ -30,9 +32,7 @@ export async function POST(request: NextRequest) {
 
     console.log(`[generate-dxf] book=${book} page=${page} endPage=${endPage} → geometryPage=${geometryPageNum}`);
     const pdfBuf = await downloadPage(book, String(geometryPageNum));
-    console.log(`[generate-dxf] downloadPage result: ${pdfBuf ? pdfBuf.length + ' bytes' : 'null'}`);
     if (!pdfBuf) {
-      console.log(`[generate-dxf] FALLBACK to merged PDF`);
       const merged = await searchRecorder(book, page, endPage);
       if (!merged) {
         return new Response(
@@ -47,14 +47,19 @@ export async function POST(request: NextRequest) {
   } catch (err) {
     console.error("[generate-dxf] Error:", err);
     return new Response(
-      JSON.stringify({ error: err instanceof Error ? err.message : "DXF generation failed" }),
+      JSON.stringify({
+        error: err instanceof Error ? err.message : "DXF generation failed",
+      }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
 }
 
 async function generateFromPdf(
-  pdfBuf: Buffer, book: string, page: string, endPage?: string,
+  pdfBuf: Buffer,
+  book: string,
+  page: string,
+  endPage?: string,
 ): Promise<Response> {
   const rendered = await renderPdfToPng(pdfBuf);
   if (!rendered) {
@@ -64,15 +69,19 @@ async function generateFromPdf(
     );
   }
 
-  const { chains, monuments } = await vectorize(rendered.base64);
-  if (chains.length === 0) {
+  const result = await vectorize(
+    rendered.base64,
+    rendered.width,
+    rendered.height,
+  );
+  if (result.paths.length === 0) {
     return new Response(
       JSON.stringify({ error: "Vectorization produced no paths" }),
       { status: 500, headers: { "Content-Type": "application/json" } },
     );
   }
 
-  const dxfContent = chainsToDxf(chains, monuments);
+  const dxfContent = pathsToDxf(result.paths);
 
   const filename = endPage
     ? `site-plan-bk${book}-pg${page}-${endPage}.dxf`
@@ -87,29 +96,20 @@ async function generateFromPdf(
   });
 }
 
-function chainsToDxf(chains: TracedChain[], monuments: Monument[]): string {
+function pathsToDxf(paths: TracedPath[]): string {
   const dxf = new DxfWriter();
   dxf.setUnits(Units.Unitless);
-
   dxf.addLayer("0", 7, "CONTINUOUS");
-  dxf.addLayer("MONUMENTS", 1, "CONTINUOUS"); // color 1 = red
-
-  // Draw vectorized line traces
   dxf.setCurrentLayerName("0");
-  for (const chain of chains) {
-    const pts = chain.points;
+
+  for (const path of paths) {
+    const pts = path.points;
     for (let i = 0; i < pts.length - 1; i++) {
       dxf.addLine(
         { x: pts[i].x, y: pts[i].y, z: 0 },
         { x: pts[i + 1].x, y: pts[i + 1].y, z: 0 },
       );
     }
-  }
-
-  // Draw detected monuments as circles
-  dxf.setCurrentLayerName("MONUMENTS");
-  for (const m of monuments) {
-    dxf.addCircle({ x: m.cx, y: m.cy, z: 0 }, m.radius);
   }
 
   return dxf.stringify();
