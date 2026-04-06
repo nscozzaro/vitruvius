@@ -16,6 +16,7 @@
     "@thatopen/components": "^3.3.3",
     "@thatopen/components-front": "^3.3.3",
     "@thatopen/fragments": "^3.3.7",
+    "canvas": "^3.2.3",
     "next": "16.2.2",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",
@@ -26,6 +27,7 @@
     "react-markdown": "^10.1.0",
     "sharp": "^0.34.5",
     "three": "^0.183.2",
+    "unpdf": "^1.4.0",
     "web-ifc": "^0.0.77"
   },
   "devDependencies": {

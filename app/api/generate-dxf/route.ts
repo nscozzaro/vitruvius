@@ -1,21 +1,19 @@
 import { NextRequest } from "next/server";
-import { fetchPdf } from "@/app/lib/parcels";
 import { searchRecorder } from "@/app/lib/recorder";
 import { renderPdfToPng, applyMask, vectorize } from "@/app/lib/vectorize";
-import { analyzeStage1, analyzeStage2 } from "@/app/lib/map-analyzer";
+import {
+  analyzeStage1, analyzeStage2,
+  type Stage1Result, type Stage2Result, type MapMetadata,
+} from "@/app/lib/map-analyzer";
 import { generateDxf } from "@/app/lib/dxf";
+import type { TracedPath } from "@/app/lib/vectorize";
 
 /**
  * POST /api/generate-dxf
  *
- * Pipeline:
- *   1. Download PDF from county surveyor
- *   2. Render to PNG (capped at 2048px)
- *   3. AI call #1: extract metadata, identify mask regions
- *   4. Mask non-geometry areas, vectorize remaining
- *   5. AI call #2: extract bearings, distances, lots, monuments, easements
- *   6. Compute exact geometry, match-and-replace traced paths
- *   7. Return DXF file
+ * Generates a DXF site plan from a county surveyor map.
+ * Gracefully handles PDF rendering failures — outputs whatever
+ * data is available (AI-extracted geometry and/or vectorized traces).
  */
 
 export const maxDuration = 120;
@@ -40,52 +38,56 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    // Step 2: Render to PNG
+    // Step 2: Render to PNG (may fail on serverless — that's OK)
     const rendered = await renderPdfToPng(pdfBuf, 2048);
-    if (!rendered) {
-      return new Response(
-        JSON.stringify({ error: "Could not render PDF to image" }),
-        { status: 500, headers: { "Content-Type": "application/json" } },
-      );
+
+    let metadata: MapMetadata = {
+      book,
+      pages: endPage ? `${page}-${endPage}` : page,
+    };
+    let geometry: Stage2Result = {
+      lots: [], streets: [], easements: [], monuments: [],
+    };
+    let traces: TracedPath[] = [];
+    let imgWidth = 1396;
+    let imgHeight = 2048;
+
+    if (rendered) {
+      imgWidth = rendered.width;
+      imgHeight = rendered.height;
+
+      // Step 3: AI call #1 — extract metadata + mask regions
+      let stage1: Stage1Result = { metadata: {}, mask_regions: [] };
+      try {
+        stage1 = await analyzeStage1(rendered.base64);
+        metadata = { ...metadata, ...stage1.metadata };
+      } catch (err) {
+        console.error("[generate-dxf] Stage 1 AI error:", err);
+      }
+
+      // Step 4: Mask and vectorize
+      try {
+        const maskedBase64 = await applyMask(
+          rendered.base64, rendered.width, rendered.height, stage1.mask_regions,
+        );
+        traces = await vectorize(maskedBase64);
+      } catch (err) {
+        console.error("[generate-dxf] Vectorize error:", err);
+      }
+
+      // Step 5: AI call #2 — extract geometry
+      try {
+        geometry = await analyzeStage2(rendered.base64);
+      } catch (err) {
+        console.error("[generate-dxf] Stage 2 AI error:", err);
+      }
+    } else {
+      console.warn("[generate-dxf] PDF rendering failed — geometry-only DXF");
     }
 
-    // Step 3: AI call #1 — extract metadata and mask regions
-    let stage1;
-    try {
-      stage1 = await analyzeStage1(rendered.base64);
-    } catch (err) {
-      console.error("[generate-dxf] Stage 1 AI error:", err);
-      stage1 = { metadata: {}, mask_regions: [] };
-    }
+    // Step 6: Generate DXF
+    const dxfContent = generateDxf(traces, geometry, metadata, imgWidth, imgHeight);
 
-    // Step 4: Mask and vectorize
-    const maskedBase64 = await applyMask(
-      rendered.base64,
-      rendered.width,
-      rendered.height,
-      stage1.mask_regions,
-    );
-    const traces = await vectorize(maskedBase64);
-
-    // Step 5: AI call #2 — extract geometry details
-    let stage2;
-    try {
-      stage2 = await analyzeStage2(rendered.base64);
-    } catch (err) {
-      console.error("[generate-dxf] Stage 2 AI error:", err);
-      stage2 = { lots: [], streets: [], easements: [], monuments: [] };
-    }
-
-    // Step 6: Generate DXF (compute geometry + match-and-replace traces)
-    const dxfContent = generateDxf(
-      traces,
-      stage2,
-      stage1.metadata,
-      rendered.width,
-      rendered.height,
-    );
-
-    // Step 7: Return DXF as file download
     const filename = endPage
       ? `site-plan-bk${book}-pg${page}-${endPage}.dxf`
       : `site-plan-bk${book}-pg${page}.dxf`;
