@@ -36,7 +36,8 @@ export async function renderPdfToPng(
     let rendered = false;
     for (const bin of bins) {
       try {
-        await execFileAsync(bin, ["-png", "-f", "1", "-l", "1", "-scale-to", String(maxSize), pdfPath, pngPrefix]);
+        // Render at 300 DPI for clean detail in handwriting and fine lines
+        await execFileAsync(bin, ["-png", "-f", "1", "-l", "1", "-r", "300", pdfPath, pngPrefix]);
         rendered = true;
         break;
       } catch { /* next */ }
