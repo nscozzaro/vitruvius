@@ -93,7 +93,7 @@ export async function vectorize(pngBase64: string): Promise<TracedChain[]> {
   // Douglas-Peucker simplification
   return chains
     .map((chain) => ({
-      points: simplify(chain, 3).map(([x, y]) => ({ x, y: h - y })),
+      points: simplify(chain, 0.8).map(([x, y]) => ({ x, y: h - y })),
     }))
     .filter((c) => c.points.length >= 2);
 }
