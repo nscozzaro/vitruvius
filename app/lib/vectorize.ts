@@ -25,8 +25,8 @@ export async function renderPdfToPng(
     const doc = mupdf.Document.openDocument(pdfBuf, "application/pdf");
     const page = doc.loadPage(0);
 
-    // Render at 600 DPI (scale from 72 DPI base)
-    const scale = 600 / 72;
+    // Render at 300 DPI — balances detail vs processing time on serverless
+    const scale = 300 / 72;
     const pixmap = page.toPixmap(
       [scale, 0, 0, scale, 0, 0],
       mupdf.ColorSpace.DeviceGray,
