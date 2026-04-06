@@ -8,56 +8,42 @@
 
 import { tmpdir } from "os";
 import { join } from "path";
-import { writeFile, readFile, unlink } from "fs/promises";
+import { writeFile, unlink } from "fs/promises";
 
 export interface TracedChain {
   points: Array<{ x: number; y: number }>;
 }
 
 /**
- * Render a PDF to PNG. Uses pdftoppm if available.
+ * Render a PDF to PNG. Uses mupdf (WASM, works everywhere including Vercel).
  */
 export async function renderPdfToPng(
   pdfBuf: Buffer,
-  maxSize = 2048,
 ): Promise<{ base64: string; width: number; height: number } | null> {
-  const { execFile } = await import("child_process");
-  const { promisify } = await import("util");
-  const execFileAsync = promisify(execFile);
-
-  const id = Math.random().toString(36).slice(2);
-  const pdfPath = join(tmpdir(), `render-${id}.pdf`);
-  const pngPrefix = join(tmpdir(), `render-${id}`);
-
   try {
-    await writeFile(pdfPath, pdfBuf);
+    const mupdf = await import("mupdf");
+    const doc = mupdf.Document.openDocument(pdfBuf, "application/pdf");
+    const page = doc.loadPage(0);
 
-    const bins = ["/opt/homebrew/bin/pdftoppm", "/usr/local/bin/pdftoppm", "/usr/bin/pdftoppm", "pdftoppm"];
-    let rendered = false;
-    for (const bin of bins) {
-      try {
-        // Render at 600 DPI for maximum detail in handwriting and fine lines
-        await execFileAsync(bin, ["-png", "-f", "1", "-l", "1", "-r", "600", pdfPath, pngPrefix]);
-        rendered = true;
-        break;
-      } catch { /* next */ }
-    }
-    if (!rendered) return null;
+    // Render at 600 DPI (scale from 72 DPI base)
+    const scale = 600 / 72;
+    const pixmap = page.toPixmap(
+      [scale, 0, 0, scale, 0, 0],
+      mupdf.ColorSpace.DeviceGray,
+    );
 
-    for (const suffix of ["-1.png", "-01.png", "-001.png"]) {
-      try {
-        const png = await readFile(pngPrefix + suffix);
-        const width = png.readUInt32BE(16);
-        const height = png.readUInt32BE(20);
-        await unlink(pngPrefix + suffix).catch(() => {});
-        return { base64: png.toString("base64"), width, height };
-      } catch { /* next */ }
-    }
+    const width = pixmap.getWidth();
+    const height = pixmap.getHeight();
+    const pngBuf = pixmap.asPNG();
+
+    return {
+      base64: Buffer.from(pngBuf).toString("base64"),
+      width,
+      height,
+    };
+  } catch (err) {
+    console.error("[renderPdfToPng] mupdf error:", err);
     return null;
-  } catch {
-    return null;
-  } finally {
-    await unlink(pdfPath).catch(() => {});
   }
 }
 

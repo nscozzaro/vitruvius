@@ -17,6 +17,7 @@
     "@thatopen/components-front": "^3.3.3",
     "@thatopen/fragments": "^3.3.7",
     "canvas": "^3.2.3",
+    "mupdf": "^1.27.0",
     "next": "16.2.2",
     "pdf-lib": "^1.17.1",
     "pdf-parse": "^1.1.1",

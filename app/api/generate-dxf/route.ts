@@ -56,7 +56,7 @@ export async function POST(request: NextRequest) {
 async function generateFromPdf(
   pdfBuf: Buffer, book: string, page: string, endPage?: string,
 ): Promise<Response> {
-  const rendered = await renderPdfToPng(pdfBuf, 2048);
+  const rendered = await renderPdfToPng(pdfBuf);
   if (!rendered) {
     return new Response(
       JSON.stringify({ error: "Could not render PDF to image" }),
