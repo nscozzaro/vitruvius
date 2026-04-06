@@ -1,7 +1,7 @@
 import { NextRequest } from "next/server";
 import { geocode, getAPN, apnToAssessorMapUrl, fetchPdf } from "@/app/lib/parcels";
 import { searchRecorder } from "@/app/lib/recorder";
-import { findTracts, recordTypeLabel } from "@/app/lib/tract-lookup";
+import { findTracts, findNearby, recordTypeLabel } from "@/app/lib/tract-lookup";
 import {
   ensureStored,
   assessorStoragePath,
@@ -105,20 +105,67 @@ export async function POST(request: NextRequest) {
             });
           }
         } else {
-          // No match via spatial lookup — still show assessor map
-          send({ type: "step", message: "Downloading assessor parcel map…" });
+          // No direct spatial match — try nearby maps as candidates
+          send({ type: "step", message: "Searching nearby recorded maps…" });
+          const nearby = findNearby(lat, lon, 5);
+
+          // Download assessor map
           const assessorPath = assessorStoragePath(apn);
           const assessorStorageUrl = await ensureStored(assessorPath, () =>
             fetchPdf(apnToAssessorMapUrl(apn)),
           );
 
-          send({
-            type: "result",
-            tractInfo: null,
-            assessorUrl: assessorStorageUrl,
-            tractMapUrl: null,
-            message: "No recorded map found in the spatial index for this location. This parcel may use an older survey not yet digitized by the county. Showing the assessor parcel map.",
-          });
+          if (nearby.length > 0) {
+            // Pick the closest as the primary result, include others as candidates
+            const best = nearby[0];
+            const endPage = best.sheets && best.sheets > 1
+              ? String(best.page + best.sheets - 1)
+              : undefined;
+            const label = recordTypeLabel(best.recordType);
+
+            send({ type: "step", message: `Nearest: ${label} — Book ${best.book}, Page ${best.page} (${best.distanceMeters}m away)` });
+            send({ type: "step", message: "Downloading maps…" });
+
+            const surveyorPath = surveyorStoragePath(
+              best.book, String(best.page), endPage,
+            );
+            const tractMapUrl = await ensureStored(surveyorPath, () =>
+              searchRecorder(best.book, String(best.page), endPage),
+            );
+
+            const tractInfo = {
+              book: best.book,
+              page: String(best.page),
+              endPage,
+              tractNumber: best.projectNo ? String(best.projectNo) : undefined,
+              mapType: label,
+            };
+
+            const otherCandidates = nearby.slice(1).map((n) => ({
+              book: n.book,
+              page: n.page,
+              mapType: recordTypeLabel(n.recordType),
+              descript: n.descript,
+              distanceMeters: n.distanceMeters,
+            }));
+
+            send({
+              type: "result",
+              tractInfo,
+              assessorUrl: assessorStorageUrl,
+              tractMapUrl,
+              nearby: otherCandidates,
+              message: `No exact boundary match — showing the nearest ${label.toLowerCase()} (${best.distanceMeters}m from the property).`,
+            });
+          } else {
+            send({
+              type: "result",
+              tractInfo: null,
+              assessorUrl: assessorStorageUrl,
+              tractMapUrl: null,
+              message: "No recorded maps found near this location. Showing the assessor parcel map.",
+            });
+          }
         }
       } catch (err) {
         send({ type: "error", message: err instanceof Error ? err.message : "Unexpected error" });

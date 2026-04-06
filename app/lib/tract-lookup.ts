@@ -92,3 +92,51 @@ export function findTracts(lat: number, lon: number): TractMatch[] {
 
   return matches;
 }
+
+export interface NearbyMatch extends TractMatch {
+  distanceMeters: number;
+}
+
+/**
+ * Find recorded maps whose centroids are nearest to the given lat/lon.
+ * Used as a fallback when no polygon contains the point.
+ * De-duplicates by book/page and returns the closest N unique maps.
+ */
+export function findNearby(lat: number, lon: number, limit = 5): NearbyMatch[] {
+  const candidates: { dist: number; props: TractMatch }[] = [];
+
+  for (const feature of data.features) {
+    const ring = feature.geometry.coordinates[0];
+    if (!ring || ring.length < 3) continue;
+
+    // Compute centroid
+    let clon = 0, clat = 0;
+    for (const pt of ring) { clon += pt[0]; clat += pt[1]; }
+    clon /= ring.length;
+    clat /= ring.length;
+
+    // Approximate distance in meters
+    const dlat = (clat - lat) * 111_000;
+    const dlon = (clon - lon) * 111_000 * Math.cos(lat * Math.PI / 180);
+    const dist = Math.sqrt(dlat * dlat + dlon * dlon);
+
+    if (dist < 1000) { // within 1km
+      candidates.push({ dist, props: feature.properties });
+    }
+  }
+
+  candidates.sort((a, b) => a.dist - b.dist);
+
+  // De-duplicate by book+page
+  const seen = new Set<string>();
+  const results: NearbyMatch[] = [];
+  for (const c of candidates) {
+    const key = `${c.props.book}/${c.props.page}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    results.push({ ...c.props, distanceMeters: Math.round(c.dist) });
+    if (results.length >= limit) break;
+  }
+
+  return results;
+}
