@@ -227,21 +227,23 @@ export async function initSession(
   const northAngle = await readNorthArrow(mapPage, pages);
   onProgress(`North angle: ${northAngle.toFixed(1)}°`);
 
-  // 6. Find anchor monument
-  onProgress(`Finding anchor monument near Lot ${targetLot}…`);
-  const anchor = await findAnchorMonument(mapPage, targetLot);
-  onProgress(`Anchor: ${anchor.description} at pixel (${anchor.px}, ${anchor.py})`);
+  // 6. Anchor registration via centerline matching
+  // This uses potrace/thinning to find actual ink lines, then matches
+  // COGO geometry against them to find the exact anchor position.
+  // NO pixel coordinate estimation from the VLM — only text reading.
+  onProgress(`Registering coordinates for Lot ${targetLot}…`);
+  const { registerAnchor } = await import("./anchor-registration");
+  const registration = await registerAnchor(
+    mapPage,
+    targetLot,
+    { feetPerInch: scaleInfo.feetPerInch, dpi: 300, scaleText: scaleInfo.scaleText },
+    northAngle,
+    onProgress,
+  );
+  const coordSystem = registration.coordSystem;
+  onProgress(`Anchor at (${registration.anchorPixel.px}, ${registration.anchorPixel.py}) — ${registration.matches.length} legs matched (confidence: ${(registration.matchConfidence * 100).toFixed(0)}%)`);
 
-  // 7. Build coordinate system
-  const coordSystem = registerCoordSystem({
-    feetPerInch: scaleInfo.feetPerInch,
-    dpi: 300,
-    northAngleDeg: northAngle,
-    anchorPixel: { px: anchor.px, py: anchor.py },
-    scaleText: scaleInfo.scaleText,
-  });
-
-  // 8. Build extraction plan
+  // 7. Build extraction plan
   onProgress(`Building extraction plan for Lot ${targetLot}…`);
   const extractionPlan = await buildExtractionPlan(mapPage, targetLot);
   onProgress(`Plan: ${extractionPlan.length} elements to extract`);
@@ -251,7 +253,7 @@ export async function initSession(
     pages: pages.map(({ pngBase64, ...rest }) => rest),
     monumentLegend,
     extractionPlan,
-    anchorDescription: anchor.description,
+    anchorDescription: `Geometric match: ${registration.matches.length} legs, confidence ${(registration.matchConfidence * 100).toFixed(0)}%`,
   };
 }
 
@@ -397,114 +399,8 @@ export async function executeStep(
     }
   }
 
-  // ─── Anchor calibration on first line element ─────────────
-  // If this is the first line (index 0 or 1) and overlap is poor, try shifting
-  // the anchor to find a position where the line actually overlaps the ink.
-  let calibratedCS: CoordSystem | undefined;
-  if (
-    planItem.index <= 1 &&
-    element.geometryType === "line" &&
-    element.bearing &&
-    element.distance &&
-    bestOverlap < RETRY_OVERLAP_THRESHOLD
-  ) {
-    // Template-line search: load full grayscale pixel buffer ONCE, then
-    // test hundreds of anchor positions by sampling directly from the buffer.
-    // No per-test sharp calls — this is pure array indexing, very fast.
-    const bearing = parseBearing(element.bearing!);
-    const lineLen = feetToPixels(coordSystem, element.distance!);
-    console.log(`[calibrate] Template-line search: bearing=${element.bearing}, dist=${element.distance}ft, lineLen=${lineLen.toFixed(0)}px`);
-
-    const sharpCal = (await import("sharp")).default;
-    const { data: allPixels, info: imgInfo } = await sharpCal(Buffer.from(page.pngBase64, "base64"))
-      .grayscale()
-      .raw()
-      .toBuffer({ resolveWithObject: true });
-    const imgW = imgInfo.width;
-    const imgH = imgInfo.height;
-    const DARK = 128;
-    const N_SAMPLES = 20;
-
-    // Fast inline overlap: sample N points along a line, check darkness
-    function fastOverlap(startPx: { px: number; py: number }, endPx: { px: number; py: number }): number {
-      let hits = 0;
-      for (let i = 0; i < N_SAMPLES; i++) {
-        const t = i / (N_SAMPLES - 1);
-        const x = Math.round(startPx.px + t * (endPx.px - startPx.px));
-        const y = Math.round(startPx.py + t * (endPx.py - startPx.py));
-        if (x < 0 || y < 0 || x >= imgW || y >= imgH) continue;
-        // Check 3x3 neighborhood for any dark pixel
-        for (let dy = -1; dy <= 1; dy++) {
-          for (let dx = -1; dx <= 1; dx++) {
-            const nx = x + dx, ny = y + dy;
-            if (nx >= 0 && ny >= 0 && nx < imgW && ny < imgH) {
-              if (allPixels[ny * imgW + nx] < DARK) { hits++; dy = 2; break; }
-            }
-          }
-        }
-      }
-      return hits / N_SAMPLES;
-    }
-
-    function makeCS(anchor: { px: number; py: number }) {
-      return registerCoordSystem({
-        feetPerInch: coordSystem.feetPerInch,
-        dpi: coordSystem.dpi,
-        northAngleDeg: (coordSystem.northAngleRad * 180) / Math.PI,
-        anchorPixel: anchor,
-        scaleText: coordSystem.scaleText,
-      });
-    }
-
-    const endSurvey = traversePoint(currentPoint, bearing, element.distance!);
-    const searchR = Math.round(Math.min(imgW, imgH) * 0.3);
-    const coarseStep = Math.round(searchR / 12);
-    let bestCalibOverlap = bestOverlap;
-    let bestAnchor = coordSystem.anchorPixel;
-
-    // Coarse pass
-    console.log(`[calibrate] Coarse: step=${coarseStep}px, radius=${searchR}px`);
-    for (let dx = -searchR; dx <= searchR; dx += coarseStep) {
-      for (let dy = -searchR; dy <= searchR; dy += coarseStep) {
-        const a = { px: coordSystem.anchorPixel.px + dx, py: coordSystem.anchorPixel.py + dy };
-        if (a.px < 0 || a.py < 0 || a.px >= imgW || a.py >= imgH) continue;
-        const cs = makeCS(a);
-        const score = fastOverlap(surveyToPixel(cs, currentPoint), surveyToPixel(cs, endSurvey));
-        if (score > bestCalibOverlap) { bestCalibOverlap = score; bestAnchor = a; }
-      }
-    }
-    console.log(`[calibrate] Coarse best: (${bestAnchor.px}, ${bestAnchor.py}) overlap=${bestCalibOverlap.toFixed(2)}`);
-
-    // Fine pass around coarse best
-    if (bestCalibOverlap > bestOverlap) {
-      const fineStep = Math.max(3, Math.round(coarseStep / 6));
-      const fineR = coarseStep;
-      const fc = { ...bestAnchor };
-      for (let dx = -fineR; dx <= fineR; dx += fineStep) {
-        for (let dy = -fineR; dy <= fineR; dy += fineStep) {
-          const a = { px: fc.px + dx, py: fc.py + dy };
-          if (a.px < 0 || a.py < 0 || a.px >= imgW || a.py >= imgH) continue;
-          const cs = makeCS(a);
-          const score = fastOverlap(surveyToPixel(cs, currentPoint), surveyToPixel(cs, endSurvey));
-          if (score > bestCalibOverlap) { bestCalibOverlap = score; bestAnchor = a; }
-        }
-      }
-      console.log(`[calibrate] Fine best: (${bestAnchor.px}, ${bestAnchor.py}) overlap=${bestCalibOverlap.toFixed(2)}`);
-    }
-
-    // Apply
-    if (bestCalibOverlap > bestOverlap) {
-      calibratedCS = makeCS(bestAnchor);
-      const s = surveyToPixel(calibratedCS, currentPoint);
-      const e = surveyToPixel(calibratedCS, endSurvey);
-      element.pixelPoints = [s, e];
-      element.overlapScore = bestCalibOverlap;
-      bestOverlap = bestCalibOverlap;
-      console.log(`[calibrate] Anchor calibrated: (${bestAnchor.px}, ${bestAnchor.py}) overlap=${bestCalibOverlap.toFixed(2)}`);
-    } else {
-      calibratedCS = undefined;
-    }
-  }
+  // Calibration is handled at init time by anchor-registration.ts
+  const calibratedCS: CoordSystem | undefined = undefined;
 
   // Build SVG fragments
   const { buildSvgFragment, buildQualityHalo, buildLabel } = await import("./svg-builder");
