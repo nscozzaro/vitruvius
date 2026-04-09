@@ -1,7 +1,8 @@
 "use client";
 
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useRef, useState, useCallback } from "react";
 import AddressInput from "@/app/components/AddressInput";
+import OcrResults from "@/app/components/OcrResults";
 
 type Step = { message: string; done: boolean };
 
@@ -27,38 +28,99 @@ type ResultState =
 
 export default function Home() {
   const [state, setState] = useState<ResultState>({ status: "idle" });
-  const [dxfUrl, setDxfUrl] = useState<string | null>(null);
-  const [dxfLoading, setDxfLoading] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [ocrResult, setOcrResult] = useState<any>(null);
+  const [ocrLoading, setOcrLoading] = useState(false);
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const [ocrProgress, setOcrProgress] = useState<any>(null);
+  const [ocrError, setOcrError] = useState<string | null>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const ocrRanForKey = useRef<string | null>(null);
 
-  // Auto-generate DXF when tract map results arrive
+  // Auto-run VLM OCR when tract info arrives
   useEffect(() => {
     if (state.status !== "done" || !state.tractInfo) {
-      setDxfUrl(null);
-      setDxfLoading(false);
+      setOcrResult(null);
+      setOcrLoading(false);
+      setOcrProgress(null);
+      setOcrError(null);
+      ocrRanForKey.current = null;
       return;
     }
 
-    const info = state.tractInfo;
-    setDxfLoading(true);
-    setDxfUrl(null);
+    const key = `${state.tractInfo.book}-${state.tractInfo.page}`;
+    if (ocrRanForKey.current === key) return;
+    ocrRanForKey.current = key;
+
+    let cancelled = false;
+    setOcrLoading(true);
+    setOcrResult(null);
+    setOcrError(null);
 
     const ctrl = new AbortController();
-    fetch("/api/generate-dxf", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ book: info.book, page: info.page, endPage: info.endPage }),
-      signal: ctrl.signal,
-    })
-      .then(async (resp) => {
-        if (!resp.ok) return;
-        const blob = await resp.blob();
-        setDxfUrl(URL.createObjectURL(blob));
-      })
-      .catch(() => {})
-      .finally(() => setDxfLoading(false));
 
-    return () => ctrl.abort();
+    (async () => {
+      try {
+        const resp = await fetch("/api/ocr", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            book: state.tractInfo!.book,
+            page: state.tractInfo!.page,
+            endPage: state.tractInfo!.endPage,
+            documentType: state.tractInfo!.mapType || "Tract Map",
+            tractNumber: state.tractInfo!.tractNumber,
+          }),
+          signal: ctrl.signal,
+        });
+
+        if (!resp.ok || !resp.body) {
+          if (!cancelled) setOcrError(`Server error: ${resp.status}`);
+          return;
+        }
+
+        const reader = resp.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = "";
+
+        while (true) {
+          const { done, value } = await reader.read();
+          if (done) break;
+
+          buffer += decoder.decode(value, { stream: true });
+          const lines = buffer.split("\n\n");
+          buffer = lines.pop() ?? "";
+
+          for (const chunk of lines) {
+            const line = chunk.replace(/^data: /, "").trim();
+            if (!line) continue;
+            try {
+              const event = JSON.parse(line);
+              if (event.type === "progress" && !cancelled) {
+                setOcrProgress(event);
+              } else if (event.type === "result" && !cancelled) {
+                setOcrResult(event.data);
+              } else if (event.type === "error" && !cancelled) {
+                setOcrError(String(event.message));
+              }
+            } catch {
+              continue;
+            }
+          }
+        }
+      } catch (err) {
+        if (!cancelled && (err as Error).name !== "AbortError") {
+          setOcrError(err instanceof Error ? err.message : "OCR failed");
+        }
+      } finally {
+        if (!cancelled) setOcrLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+      ctrl.abort();
+    };
   }, [state]);
 
   const handleSubmit = async (address: string) => {
@@ -234,12 +296,27 @@ export default function Home() {
                     }
                     pdfUrl={state.tractMapUrl}
                     icon="survey"
-                    dxfUrl={dxfUrl}
-                    dxfLoading={dxfLoading}
-                    dxfFilename={state.tractInfo ? `site-plan-bk${state.tractInfo.book}-pg${state.tractInfo.page}.dxf` : undefined}
                   />
                 )}
               </div>
+
+              {/* OCR Results */}
+              <OcrResults
+                result={ocrResult}
+                loading={ocrLoading}
+                progress={ocrProgress}
+                error={ocrError}
+                jsonFilename={
+                  state.tractInfo
+                    ? `ocr-bk${state.tractInfo.book}-pg${state.tractInfo.page}.json`
+                    : undefined
+                }
+                pdfFilename={
+                  state.tractInfo
+                    ? `searchable-bk${state.tractInfo.book}-pg${state.tractInfo.page}.pdf`
+                    : undefined
+                }
+              />
             </>
           )}
 
@@ -260,17 +337,11 @@ function MapCard({
   description,
   pdfUrl,
   icon,
-  dxfUrl,
-  dxfLoading,
-  dxfFilename,
 }: {
   title: string;
   description: string;
   pdfUrl: string;
   icon: "parcel" | "survey";
-  dxfUrl?: string | null;
-  dxfLoading?: boolean;
-  dxfFilename?: string;
 }) {
   return (
     <div className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white transition-all hover:border-zinc-400 hover:shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500">
@@ -335,32 +406,6 @@ function MapCard({
         <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           {description}
         </p>
-        {(dxfUrl || dxfLoading) && (
-          <a
-            href={dxfUrl || "#"}
-            download={dxfFilename || "site-plan.dxf"}
-            onClick={(e) => { if (!dxfUrl) e.preventDefault(); }}
-            className={`mt-2 flex w-full items-center justify-center gap-2 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors ${
-              dxfUrl
-                ? "border-blue-300 bg-blue-50 text-blue-700 hover:bg-blue-100 dark:border-blue-700 dark:bg-blue-900/30 dark:text-blue-300 dark:hover:bg-blue-900/50"
-                : "border-zinc-200 bg-zinc-50 text-zinc-400 cursor-wait dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-500"
-            }`}
-          >
-            {dxfLoading ? (
-              <>
-                <span className="h-3 w-3 animate-spin rounded-full border-2 border-zinc-400 border-t-transparent" />
-                Preparing DXF…
-              </>
-            ) : (
-              <>
-                <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
-                  <path strokeLinecap="round" strokeLinejoin="round" d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                </svg>
-                Download DXF Site Plan
-              </>
-            )}
-          </a>
-        )}
       </div>
     </div>
   );

@@ -1,11 +1,14 @@
 /**
  * Santa Barbara County Surveyor — recorded map lookup.
  *
- * The County Surveyor's office hosts all recorded maps at
- * surveyor.countyofsb.org with a clean REST API:
+ * PDFs are served at two endpoints (tried in order):
  *
- *   GET /mapview/api/rm/{book}/{page}
- *   → { FileURLFull, FileExists, ... }
+ *   1. Direct PDF: /rm_pdfs/BK{book}/R{book}_{page}.pdf
+ *      (new SimpleLayers-based system, most reliable)
+ *
+ *   2. REST API:   /mapview/api/rm/{book}/{page}
+ *      → { FileURLFull, FileExists, ... }
+ *      (legacy, sometimes down)
  *
  * Multi-page maps (e.g., pages 20-22) are stored as separate PDFs.
  * This module downloads all pages and merges them into a single PDF.
@@ -13,7 +16,8 @@
 
 import { PDFDocument } from "pdf-lib";
 
-const SURVEYOR_API = "https://surveyor.countyofsb.org/mapview/api/rm";
+const SURVEYOR_BASE = "https://surveyor.countyofsb.org";
+const SURVEYOR_API = `${SURVEYOR_BASE}/mapview/api/rm`;
 
 interface SurveyorResponse {
   FileURLFull: string;
@@ -76,12 +80,42 @@ export async function searchRecorder(
   }
 }
 
+/**
+ * Build the direct PDF URL for a given book/page.
+ * Pattern: /rm_pdfs/BK076/R076_020.pdf (zero-padded to 3 digits)
+ */
+function directPdfUrl(book: string, page: string): string {
+  const bk = book.padStart(3, "0");
+  const pg = page.padStart(3, "0");
+  return `${SURVEYOR_BASE}/rm_pdfs/BK${bk}/R${bk}_${pg}.pdf`;
+}
+
 /** Downloads a single page PDF from the surveyor. */
 export async function downloadPage(
   book: string,
   page: string,
 ): Promise<Buffer | null> {
+  // Try direct PDF URL first (new SimpleLayers pattern, most reliable)
   try {
+    const url = directPdfUrl(book, page);
+    console.log(`[recorder] trying direct PDF: ${url}`);
+    const resp = await fetch(url, {
+      headers: { "User-Agent": "Vitruvius/1.0" },
+      signal: AbortSignal.timeout(15000),
+    });
+    if (resp.ok) {
+      const ct = resp.headers.get("content-type") || "";
+      if (ct.includes("pdf") || ct.includes("octet-stream")) {
+        return Buffer.from(await resp.arrayBuffer());
+      }
+    }
+  } catch {
+    // fall through to legacy API
+  }
+
+  // Fallback: legacy REST API
+  try {
+    console.log(`[recorder] trying legacy API: ${SURVEYOR_API}/${book}/${page}`);
     const resp = await fetch(`${SURVEYOR_API}/${book}/${page}`, {
       headers: { "User-Agent": "Vitruvius/1.0" },
       signal: AbortSignal.timeout(10000),

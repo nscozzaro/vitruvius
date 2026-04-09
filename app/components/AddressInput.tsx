@@ -123,15 +123,6 @@ export default function AddressInput({ onSubmit, disabled }: AddressInputProps) 
               <span className="h-5 w-5 block animate-spin rounded-full border-2 border-blue-500 border-t-transparent" />
             </div>
           )}
-          {!disabled && address.trim() && (
-            <button
-              type="button"
-              onClick={() => submit(address)}
-              className="mr-2 rounded-xl bg-zinc-900 px-4 py-2 text-sm font-medium text-white transition-colors hover:bg-zinc-800 dark:bg-white dark:text-zinc-900 dark:hover:bg-zinc-200"
-            >
-              Go
-            </button>
-          )}
         </div>
       </div>
 

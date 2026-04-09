@@ -2,7 +2,7 @@ import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
   turbopack: {},
-  serverExternalPackages: ["potrace", "sharp", "mupdf"],
+  serverExternalPackages: ["sharp", "mupdf"],
 };
 
 export default nextConfig;
