@@ -153,7 +153,7 @@ export function parseJsonResponse<T>(response: string): T {
 
   // Strip ```json ... ``` fences (greedy — handles truncated responses)
   const fenceMatch = cleaned.match(/```(?:json)?\s*\n?([\s\S]*?)(?:\n?\s*```|$)/);
-  if (fenceMatch && fenceMatch[1].trim().startsWith("{") || fenceMatch && fenceMatch[1].trim().startsWith("[")) {
+  if (fenceMatch && (fenceMatch[1].trim().startsWith("{") || fenceMatch[1].trim().startsWith("["))) {
     cleaned = fenceMatch[1].trim();
   }
 
@@ -176,7 +176,7 @@ export function parseJsonResponse<T>(response: string): T {
   // If truncated (no closing brace/bracket), try to repair
   try {
     return JSON.parse(cleaned);
-  } catch {
+  } catch (err) {
     // Try adding missing closing brackets/braces
     let repaired = cleaned;
     const opens = (repaired.match(/\{/g) || []).length;
@@ -190,6 +190,15 @@ export function parseJsonResponse<T>(response: string): T {
     // Remove trailing comma before closing bracket/brace
     repaired = repaired.replace(/,\s*([}\]])/g, "$1");
 
-    return JSON.parse(repaired);
+    try {
+      return JSON.parse(repaired);
+    } catch (parseErr) {
+      // Log the actual response for debugging
+      console.error("[nim-client] Failed to parse JSON response:");
+      console.error("[nim-client] Original:", response.slice(0, 200));
+      console.error("[nim-client] Cleaned:", cleaned.slice(0, 200));
+      console.error("[nim-client] Repaired:", repaired.slice(0, 200));
+      throw new Error(`JSON parse error: ${parseErr instanceof Error ? parseErr.message : "unknown"}`);
+    }
   }
 }

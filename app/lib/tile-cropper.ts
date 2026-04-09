@@ -221,5 +221,11 @@ Only include lots you can clearly identify by number on the map.`,
     { maxTokens: 2048, temperature: 0.1 },
   );
 
-  return pj(response);
+  try {
+    return pj(response);
+  } catch (err) {
+    console.error("[tile-cropper] detectLotRegions failed:", err instanceof Error ? err.message : err);
+    // Return empty array if detection fails — the fallback will handle it
+    return [];
+  }
 }
