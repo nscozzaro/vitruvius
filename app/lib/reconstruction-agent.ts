@@ -399,8 +399,13 @@ export async function executeStep(
     }
   }
 
-  // Calibration is handled at init time by anchor-registration.ts
   const calibratedCS: CoordSystem | undefined = undefined;
+
+  // ─── Quality gate: if first element has 0% overlap, warn the client ──
+  if (planItem.index <= 1 && bestOverlap === 0) {
+    console.log(`[step ${planItem.index}] WARNING: First element has 0% overlap — anchor is likely wrong`);
+    element.description += " [WARNING: 0% overlap — anchor may be misplaced]";
+  }
 
   // Build SVG fragments
   const { buildSvgFragment, buildQualityHalo, buildLabel } = await import("./svg-builder");
