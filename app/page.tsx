@@ -237,6 +237,7 @@ export default function Home() {
                     dxfUrl={dxfUrl}
                     dxfLoading={dxfLoading}
                     dxfFilename={state.tractInfo ? `site-plan-bk${state.tractInfo.book}-pg${state.tractInfo.page}.dxf` : undefined}
+                    reconstructUrl={state.tractInfo ? `/reconstruct?book=${state.tractInfo.book}&page=${state.tractInfo.page}${state.tractInfo.endPage ? `&endPage=${state.tractInfo.endPage}` : ""}&lot=5` : undefined}
                   />
                 )}
               </div>
@@ -263,6 +264,7 @@ function MapCard({
   dxfUrl,
   dxfLoading,
   dxfFilename,
+  reconstructUrl,
 }: {
   title: string;
   description: string;
@@ -271,6 +273,7 @@ function MapCard({
   dxfUrl?: string | null;
   dxfLoading?: boolean;
   dxfFilename?: string;
+  reconstructUrl?: string;
 }) {
   return (
     <div className="flex flex-col overflow-hidden rounded-xl border border-zinc-200 bg-white transition-all hover:border-zinc-400 hover:shadow-lg dark:border-zinc-700 dark:bg-zinc-900 dark:hover:border-zinc-500">
@@ -335,6 +338,17 @@ function MapCard({
         <p className="mt-0.5 text-xs text-zinc-500 dark:text-zinc-400">
           {description}
         </p>
+        {reconstructUrl && (
+          <a
+            href={reconstructUrl}
+            className="mt-2 flex w-full items-center justify-center gap-2 rounded-lg border border-purple-300 bg-purple-50 px-3 py-1.5 text-xs font-medium text-purple-700 transition-colors hover:bg-purple-100 dark:border-purple-700 dark:bg-purple-900/30 dark:text-purple-300 dark:hover:bg-purple-900/50"
+          >
+            <svg className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+              <path strokeLinecap="round" strokeLinejoin="round" d="M15.042 21.672L13.684 16.6m0 0l-2.51 2.225.569-9.47 5.227 7.917-3.286-.672zM12 2.25V4.5m5.834.166l-1.591 1.591M20.25 10.5H18M7.757 14.743l-1.59 1.59M6 10.5H3.75m4.007-4.243l-1.59-1.59" />
+            </svg>
+            Reconstruct Survey
+          </a>
+        )}
         {(dxfUrl || dxfLoading) && (
           <a
             href={dxfUrl || "#"}
