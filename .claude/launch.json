@@ -5,8 +5,7 @@
       "name": "next-dev",
       "runtimeExecutable": "/usr/bin/env",
       "runtimeArgs": ["-S", "PATH=/opt/homebrew/bin:/opt/homebrew/sbin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin", "npm", "run", "dev"],
-      "port": 3000,
-      "autoPort": true
+      "port": 3000
     }
   ]
 }

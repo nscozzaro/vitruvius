@@ -23,6 +23,7 @@ interface StepRequest {
   planItem: ExtractionPlanItem;
   previousOverlapScore: number | null;
   monumentLegend: MonumentLegendEntry[];
+  consecutiveLowCount?: number;
 }
 
 export async function POST(request: NextRequest) {
@@ -36,6 +37,7 @@ export async function POST(request: NextRequest) {
     planItem,
     previousOverlapScore,
     monumentLegend,
+    consecutiveLowCount,
   } = body;
 
   if (!pageKey || !coordSystem || !currentPoint || !planItem) {
@@ -54,6 +56,7 @@ export async function POST(request: NextRequest) {
       planItem,
       previousOverlapScore,
       monumentLegend,
+      consecutiveLowCount ?? 0,
     );
 
     return Response.json(result);

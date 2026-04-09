@@ -166,7 +166,9 @@ function ReconstructPageInner() {
     }
   }, [book, page, endPage, targetLot]);
 
-  // ─── Extraction loop ─────────────────────────────────────
+  const [haltReason, setHaltReason] = useState<string | null>(null);
+
+  // ─── Extraction loop (with quality gates) ───────────────
   const runExtraction = useCallback(
     async (
       data: InitData,
@@ -179,6 +181,7 @@ function ReconstructPageInner() {
       let point = startPoint;
       let bearing = startBearing;
       let overlap = startOverlap;
+      let consecutiveLow = 0;
 
       for (let i = 0; i < data.extractionPlan.length; i++) {
         if (ctrl.signal.aborted || pauseRef.current) {
@@ -206,6 +209,7 @@ function ReconstructPageInner() {
               planItem,
               previousOverlapScore: overlap,
               monumentLegend: data.monumentLegend,
+              consecutiveLowCount: consecutiveLow,
             }),
             signal: ctrl.signal,
           });
@@ -214,6 +218,7 @@ function ReconstructPageInner() {
             const err = await resp.json().catch(() => ({ error: "Step failed" }));
             updatedSteps[i] = { ...updatedSteps[i], status: "error" };
             setTimelineSteps([...updatedSteps]);
+            consecutiveLow++;
             continue;
           }
 
@@ -233,7 +238,6 @@ function ReconstructPageInner() {
           point = result.nextPoint;
           bearing = result.nextBearing;
 
-          // If anchor was recalibrated, update the coord system for subsequent steps
           if (result.calibratedCoordSystem) {
             data.coordSystem = result.calibratedCoordSystem;
           }
@@ -241,6 +245,13 @@ function ReconstructPageInner() {
           setCurrentPoint(point);
           setCurrentBearing(bearing);
           setLastOverlap(overlap);
+
+          // Track consecutive low-quality elements
+          if ((overlap ?? 0) < 0.2) {
+            consecutiveLow++;
+          } else {
+            consecutiveLow = 0;
+          }
 
           updatedSteps[i] = {
             ...updatedSteps[i],
@@ -250,10 +261,33 @@ function ReconstructPageInner() {
           };
           steps = updatedSteps;
           setTimelineSteps([...updatedSteps]);
+
+          // ─── Quality gates: auto-pause on bad placement ──
+          if (result.anchorFailed) {
+            const correction = result.suggestedAnchorCorrection
+              ? ` Suggested offset: (${result.suggestedAnchorCorrection.dx}, ${result.suggestedAnchorCorrection.dy})px.`
+              : "";
+            setHaltReason(
+              `Anchor placement appears incorrect — first element has ${((overlap ?? 0) * 100).toFixed(0)}% alignment.${correction} The extraction has been paused to prevent placing incorrect elements.`,
+            );
+            pauseRef.current = true;
+            setSession({ phase: "paused", data, stepIndex: i + 1 });
+            return;
+          }
+
+          if (result.haltRecommended) {
+            setHaltReason(
+              `${consecutiveLow} consecutive elements with poor alignment (< 20%). The coordinate system may be off. Extraction paused.`,
+            );
+            pauseRef.current = true;
+            setSession({ phase: "paused", data, stepIndex: i + 1 });
+            return;
+          }
         } catch (err) {
           if ((err as Error).name === "AbortError") return;
           updatedSteps[i] = { ...updatedSteps[i], status: "error" };
           setTimelineSteps([...updatedSteps]);
+          consecutiveLow++;
         }
       }
 
@@ -271,6 +305,7 @@ function ReconstructPageInner() {
   const handleResume = useCallback(() => {
     if (session.phase !== "paused") return;
     pauseRef.current = false;
+    setHaltReason(null);
     const ctrl = new AbortController();
     abortRef.current = ctrl;
 
@@ -436,6 +471,18 @@ function ReconstructPageInner() {
             opacity={opacity}
             onOpacityChange={setOpacity}
           />
+
+          {/* Quality gate halt banner */}
+          {haltReason && (
+            <div className="border-t border-red-300 bg-red-50 px-3 py-2 dark:border-red-800 dark:bg-red-900/30">
+              <p className="text-[11px] font-medium text-red-700 dark:text-red-300">
+                Extraction Paused
+              </p>
+              <p className="mt-0.5 text-[10px] text-red-600 dark:text-red-400">
+                {haltReason}
+              </p>
+            </div>
+          )}
 
           {/* Stats footer */}
           {elements.length > 0 && (

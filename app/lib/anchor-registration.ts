@@ -1,22 +1,30 @@
 /**
  * Anchor Registration — find the precise pixel position of the lot's POB
- * using ruler-marked crops and visual validation.
+ * using geometric matching against SVG features from potrace.
  *
- * Strategy:
- * 1. VLM locates the lot (coarse bounding box)
- * 2. Crop tightly, add pixel rulers along edges
- * 3. VLM reads ruler marks to estimate the POB monument position
- * 4. Draw crosshair at estimated position, ask VLM to validate
- * 5. Iterate until validated or max attempts reached
+ * Strategy (SVG-first, no VLM pixel estimation):
+ * 1. VLM locates the lot area (coarse bounding box — text reading, not pixel coords)
+ * 2. VLM reads the lot's metes-and-bounds text (bearings + distances)
+ * 3. COGO computes the expected lot boundary shape from those bearings/distances
+ * 4. For each SVG monument in the lot area, hypothesize it as POB:
+ *    - Project COGO traverse into pixel space using this anchor
+ *    - Score alignment against SVG boundary paths
+ * 5. The monument with best alignment wins — pure geometry, sub-pixel accuracy
  *
- * This approach gives the VLM explicit spatial reference (rulers)
- * and a feedback loop (visual validation) to converge on the right spot.
+ * The VLM reads TEXT (which it's good at). All spatial positioning is
+ * deterministic geometry matching (which machines are good at).
  */
 
-import { registerCoordSystem, type CoordSystem } from "./coord-system";
+import { registerCoordSystem, type CoordSystem, surveyToPixel } from "./coord-system";
+import { parseBearing, traversePoint } from "./cogo";
+import type { Point } from "./cogo";
 import { nimVision, parseJsonResponse } from "./nim-client";
-import { overviewTile, type CropRegion } from "./tile-cropper";
+import { overviewTile, type CropRegion, cropTile } from "./tile-cropper";
 import type { PageInfo } from "./reconstruction-agent";
+import type { SvgFeatureMap, SvgMonument } from "./svg-features";
+import { findFeaturesInRegion, scorePlacement } from "./svg-features";
+import { vectorizeToSvg } from "./vectorize";
+import { extractSvgFeatures } from "./svg-features";
 
 export interface RegistrationResult {
   coordSystem: CoordSystem;
@@ -25,9 +33,15 @@ export interface RegistrationResult {
   cropRegion: CropRegion;
   validated: boolean;
   matches: Array<Record<string, unknown>>;
+  /** SVG features extracted from the page — reused during step execution */
+  svgFeatures: SvgFeatureMap;
 }
 
-const MAX_VALIDATION_ROUNDS = 3;
+interface LotBoundaryReading {
+  bearing: string;
+  distance: number;
+  type: "line" | "curve";
+}
 
 export async function registerAnchor(
   page: PageInfo,
@@ -36,29 +50,33 @@ export async function registerAnchor(
   northAngleDeg: number,
   onProgress: (msg: string) => void,
 ): Promise<RegistrationResult> {
-  const sharpMod = (await import("sharp")).default;
+  // ─── Step 1: Vectorize page → extract SVG features ──────
+  onProgress("Vectorizing map for geometric analysis…");
+  const svgResult = await vectorizeToSvg(page.pngBase64, page.width, page.height);
+  const svgFeatures = extractSvgFeatures(svgResult.rawSvg, page.width, page.height);
+  onProgress(`Found ${svgFeatures.monuments.length} monument candidates, ${svgFeatures.boundaryLines.length} boundary segments`);
 
-  // ─── Step 1: Locate lot area ─────────────────────────────
+  // ─── Step 2: VLM locates lot area (coarse) ──────────────
   onProgress("Locating lot area on map…");
   const overview = await overviewTile(page.pngBase64, page.width, page.height);
 
-  const lotLocResponse = await nimVision(
-    overview.base64,
-    `Find Lot ${targetLot} on this subdivision/tract map.
+  let cropRegion: CropRegion;
+  try {
+    const lotLocResponse = await nimVision(
+      overview.base64,
+      `Find Lot ${targetLot} on this subdivision/tract map.
 Return the bounding box of the lot as percentages of the image:
 { "x_pct": 30, "y_pct": 40, "width_pct": 15, "height_pct": 20 }
 
 x_pct/y_pct = top-left corner. width_pct/height_pct = size.
 Include some padding around the lot boundaries.`,
-    { maxTokens: 256, temperature: 0.1 },
-  );
+      { maxTokens: 256, temperature: 0.1 },
+    );
 
-  let cropRegion: CropRegion;
-  try {
     const loc = parseJsonResponse<{
       x_pct: number; y_pct: number; width_pct: number; height_pct: number;
     }>(lotLocResponse);
-    const padPct = 8;
+    const padPct = 12;
     cropRegion = {
       x: Math.max(0, Math.round(((loc.x_pct - padPct) / 100) * page.width)),
       y: Math.max(0, Math.round(((loc.y_pct - padPct) / 100) * page.height)),
@@ -67,176 +85,210 @@ Include some padding around the lot boundaries.`,
       label: `lot-${targetLot}-reg`,
     };
   } catch {
+    // Fallback: center half of the image
     cropRegion = {
       x: Math.round(page.width * 0.15),
       y: Math.round(page.height * 0.15),
-      width: Math.round(page.width * 0.5),
-      height: Math.round(page.height * 0.5),
+      width: Math.round(page.width * 0.7),
+      height: Math.round(page.height * 0.7),
       label: `lot-${targetLot}-reg-fallback`,
     };
   }
   // Clamp
   if (cropRegion.x + cropRegion.width > page.width) cropRegion.width = page.width - cropRegion.x;
   if (cropRegion.y + cropRegion.height > page.height) cropRegion.height = page.height - cropRegion.y;
-  onProgress(`Lot crop: (${cropRegion.x}, ${cropRegion.y}) ${cropRegion.width}x${cropRegion.height}px`);
+  onProgress(`Lot search region: (${cropRegion.x}, ${cropRegion.y}) ${cropRegion.width}×${cropRegion.height}px`);
 
-  // ─── Step 2: Crop and add rulers ─────────────────────────
-  const meta = await sharpMod(Buffer.from(page.pngBase64, "base64")).metadata();
-  const imgW = meta.width ?? page.width;
-  const imgH = meta.height ?? page.height;
+  // ─── Step 3: VLM reads lot boundary bearings/distances ──
+  onProgress("Reading lot boundary bearings and distances…");
+  const tile = await cropTile(page.pngBase64, cropRegion);
 
-  let left = Math.max(0, cropRegion.x);
-  let top = Math.max(0, cropRegion.y);
-  let cw = Math.min(cropRegion.width, imgW - left);
-  let ch = Math.min(cropRegion.height, imgH - top);
-  cw = Math.max(1, cw);
-  ch = Math.max(1, ch);
+  const boundaryResponse = await nimVision(
+    tile.base64,
+    `Read the metes and bounds of Lot ${targetLot} on this tract map.
+Starting from the Point of Beginning (POB), list the FIRST 3-4 boundary line segments in clockwise order.
 
-  const cropBuf = await sharpMod(Buffer.from(page.pngBase64, "base64"))
-    .extract({ left, top, width: cw, height: ch })
-    .toColourspace("srgb")
-    .toBuffer();
-
-  // Resize for VLM (max 2048) while tracking scale
-  const vlmScale = Math.min(2048 / cw, 2048 / ch, 1);
-  const vlmW = Math.round(cw * vlmScale);
-  const vlmH = Math.round(ch * vlmScale);
-
-  // ─── Step 3: Iterative anchor finding with validation ────
-  let anchorCropX = cw / 2; // initial estimate: center of crop
-  let anchorCropY = ch / 2;
-  let validated = false;
-
-  for (let round = 0; round < MAX_VALIDATION_ROUNDS; round++) {
-    // Create ruler-marked image
-    const rulerSpacing = 200; // pixels in crop space
-    const rulerSvgParts: string[] = [];
-
-    // Top ruler (X axis)
-    for (let x = 0; x <= cw; x += rulerSpacing) {
-      const sx = Math.round(x * vlmScale);
-      rulerSvgParts.push(`<line x1="${sx}" y1="0" x2="${sx}" y2="15" stroke="red" stroke-width="2"/>`);
-      rulerSvgParts.push(`<text x="${sx + 2}" y="13" fill="red" font-size="11" font-family="sans-serif">${x}</text>`);
-    }
-    // Left ruler (Y axis)
-    for (let y = 0; y <= ch; y += rulerSpacing) {
-      const sy = Math.round(y * vlmScale);
-      rulerSvgParts.push(`<line x1="0" y1="${sy}" x2="15" y2="${sy}" stroke="red" stroke-width="2"/>`);
-      rulerSvgParts.push(`<text x="2" y="${sy + 12}" fill="red" font-size="11" font-family="sans-serif">${y}</text>`);
-    }
-
-    // If not first round, draw crosshair at current estimate for validation
-    if (round > 0) {
-      const cx = Math.round(anchorCropX * vlmScale);
-      const cy = Math.round(anchorCropY * vlmScale);
-      rulerSvgParts.push(`<circle cx="${cx}" cy="${cy}" r="15" fill="none" stroke="red" stroke-width="3"/>`);
-      rulerSvgParts.push(`<line x1="${cx - 25}" y1="${cy}" x2="${cx + 25}" y2="${cy}" stroke="red" stroke-width="2"/>`);
-      rulerSvgParts.push(`<line x1="${cx}" y1="${cy - 25}" x2="${cx}" y2="${cy + 25}" stroke="red" stroke-width="2"/>`);
-    }
-
-    const rulerSvg = `<svg width="${vlmW}" height="${vlmH}">${rulerSvgParts.join("")}</svg>`;
-
-    const markedBuf = await sharpMod(cropBuf)
-      .resize(vlmW, vlmH)
-      .composite([{ input: Buffer.from(rulerSvg), top: 0, left: 0 }])
-      .jpeg({ quality: 90 })
-      .toBuffer();
-
-    if (round === 0) {
-      // First round: ask for the POB location
-      onProgress(`Round ${round + 1}: Finding POB monument with rulers…`);
-      const response = await nimVision(
-        markedBuf.toString("base64"),
-        `This crop shows Lot ${targetLot} from a tract map. Red tick marks along the top and left edges show PIXEL COORDINATES within this crop (every ${rulerSpacing} pixels).
-
-Find the SOUTHEAST (bottom-right) corner of Lot ${targetLot}'s boundary. This corner should have a small filled circle (●) or open circle (○) — a survey monument marker where two boundary lines meet.
-
-Using the red ruler ticks, estimate the pixel coordinates of this monument's CENTER within the crop.
+For each segment, read:
+- bearing: quadrant bearing (e.g., "N 75°22'10" W")
+- distance: length in feet
 
 Return valid JSON:
-{ "x": 850, "y": 1200, "description": "SE corner monument of Lot ${targetLot}" }
+{
+  "segments": [
+    { "bearing": "N 75°22'10\\" W", "distance": 146.31, "type": "line" },
+    { "bearing": "S 89°59'51\\" E", "distance": 80.00, "type": "line" }
+  ]
+}
 
-Look carefully at the ruler numbers. Interpolate between ticks for precision.`,
-        { maxTokens: 256, temperature: 0.1 },
-      );
+Read ONLY straight line segments (not curves). Accuracy matters — read every degree, minute, and second carefully.`,
+    { maxTokens: 1024, temperature: 0.1 },
+  );
 
-      try {
-        const data = parseJsonResponse<{ x: number; y: number; description: string }>(response);
-        anchorCropX = Math.max(0, Math.min(cw, data.x));
-        anchorCropY = Math.max(0, Math.min(ch, data.y));
-        onProgress(`Round ${round + 1}: estimate at crop (${Math.round(anchorCropX)}, ${Math.round(anchorCropY)}): ${data.description}`);
-      } catch {
-        onProgress(`Round ${round + 1}: failed to parse, using crop center`);
+  let segments: LotBoundaryReading[] = [];
+  try {
+    const data = parseJsonResponse<{ segments: LotBoundaryReading[] }>(boundaryResponse);
+    segments = data.segments?.filter((s) => s.bearing && s.distance > 0) ?? [];
+  } catch {
+    // Will fall back to monument-only matching below
+  }
+  onProgress(`Read ${segments.length} boundary segments from lot text`);
+
+  // ─── Step 4: COGO traverse from readings ────────────────
+  // Build expected lot shape relative to origin (0,0)
+  const traversePoints: Point[] = [{ x: 0, y: 0 }];
+  let current: Point = { x: 0, y: 0 };
+  for (const seg of segments) {
+    try {
+      const bearingRad = parseBearing(seg.bearing);
+      current = traversePoint(current, bearingRad, seg.distance);
+      traversePoints.push(current);
+    } catch {
+      // Skip unparseable bearings
+    }
+  }
+
+  const pxPerFoot = scaleInfo.dpi / scaleInfo.feetPerInch;
+  const northAngleRad = (northAngleDeg * Math.PI) / 180;
+
+  // ─── Step 5: Score each monument candidate ──────────────
+  onProgress("Scoring monument candidates for best-fit anchor…");
+  const { monuments: candidateMonuments } = findFeaturesInRegion(svgFeatures, {
+    x: cropRegion.x,
+    y: cropRegion.y,
+    w: cropRegion.width,
+    h: cropRegion.height,
+  });
+  onProgress(`${candidateMonuments.length} monuments in search region`);
+  console.log(`[anchor] SVG features: ${svgFeatures.monuments.length} total monuments, ${svgFeatures.boundaryLines.length} boundary segments`);
+  console.log(`[anchor] Search region: x=${cropRegion.x} y=${cropRegion.y} w=${cropRegion.width} h=${cropRegion.height}`);
+  console.log(`[anchor] ${candidateMonuments.length} monument candidates in region`);
+  console.log(`[anchor] COGO traverse points: ${traversePoints.length} (from ${segments.length} boundary readings)`);
+  if (segments.length > 0) {
+    console.log(`[anchor] First segment: ${segments[0].bearing} ${segments[0].distance}ft`);
+  }
+
+  let bestMonument: SvgMonument | null = null;
+  let bestScore = -1;
+  let bestCS: CoordSystem | null = null;
+
+  for (const mon of candidateMonuments) {
+    const anchorPixel = { px: Math.round(mon.center.x), py: Math.round(mon.center.y) };
+    const cs = registerCoordSystem({
+      feetPerInch: scaleInfo.feetPerInch,
+      dpi: scaleInfo.dpi,
+      northAngleDeg,
+      anchorPixel,
+      scaleText: scaleInfo.scaleText,
+    });
+
+    // Project COGO traverse into pixel space using this anchor hypothesis
+    const projectedPixels = traversePoints.map((p) => surveyToPixel(cs, p));
+
+    // Score against SVG boundary features
+    if (projectedPixels.length >= 2) {
+      const { score } = scorePlacement(projectedPixels, svgFeatures);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMonument = mon;
+        bestCS = cs;
       }
     } else {
-      // Validation round: crosshair is drawn, ask if it's correct
-      onProgress(`Round ${round + 1}: Validating anchor position…`);
-      const response = await nimVision(
-        markedBuf.toString("base64"),
-        `I've placed a RED CROSSHAIR (+) on this tract map crop. The crosshair should be exactly centered on the southeast corner monument of Lot ${targetLot} — a small filled or open circle where two lot boundary lines meet.
-
-Is the crosshair directly on a survey monument marker?
-
-If YES (crosshair is on or within a few pixels of a monument dot):
-{ "valid": true }
-
-If NO (crosshair is NOT on a monument):
-{ "valid": false, "correction_x": -50, "correction_y": 30, "reason": "The crosshair is 50 pixels too far right and 30 pixels too far up from the nearest monument" }
-
-correction_x/y are in CROP PIXEL COORDINATES (using the ruler ticks as reference).
-Negative x = move left, positive x = move right.
-Negative y = move up, positive y = move down.`,
-        { maxTokens: 256, temperature: 0.1 },
-      );
-
-      try {
-        const data = parseJsonResponse<{
-          valid: boolean;
-          correction_x?: number;
-          correction_y?: number;
-          reason?: string;
-        }>(response);
-
-        if (data.valid) {
-          validated = true;
-          onProgress(`Round ${round + 1}: VALIDATED — anchor confirmed on monument`);
-          break;
-        }
-
-        // Apply correction
-        const cx = data.correction_x ?? 0;
-        const cy = data.correction_y ?? 0;
-        anchorCropX = Math.max(0, Math.min(cw, anchorCropX + cx));
-        anchorCropY = Math.max(0, Math.min(ch, anchorCropY + cy));
-        onProgress(`Round ${round + 1}: NOT on monument. Adjusting by (${cx}, ${cy}). ${data.reason ?? ""}`);
-      } catch {
-        onProgress(`Round ${round + 1}: failed to parse validation response`);
-        break;
+      // No boundary readings — score by proximity to boundary line endpoints
+      // (monuments at lot corners should be near line intersections)
+      const nearby = findFeaturesInRegion(svgFeatures, {
+        x: mon.center.x - 30,
+        y: mon.center.y - 30,
+        w: 60,
+        h: 60,
+      });
+      // More nearby boundary segments = more likely a real corner monument
+      const score = Math.min(1, nearby.segments.length / 4);
+      if (score > bestScore) {
+        bestScore = score;
+        bestMonument = mon;
+        bestCS = registerCoordSystem({
+          feetPerInch: scaleInfo.feetPerInch,
+          dpi: scaleInfo.dpi,
+          northAngleDeg,
+          anchorPixel,
+          scaleText: scaleInfo.scaleText,
+        });
       }
     }
   }
 
-  // Convert crop-local anchor to full-image coordinates
-  const anchorPx = {
-    px: Math.round(left + anchorCropX),
-    py: Math.round(top + anchorCropY),
-  };
-  onProgress(`Final anchor: (${anchorPx.px}, ${anchorPx.py}) in full image${validated ? " [VALIDATED]" : " [unvalidated]"}`);
+  console.log(`[anchor] Best monument: ${bestMonument ? `(${bestMonument.center.x.toFixed(0)}, ${bestMonument.center.y.toFixed(0)}) r=${bestMonument.radius.toFixed(1)} circ=${bestMonument.circularity.toFixed(2)} score=${bestScore.toFixed(4)}` : "NONE"}`);
 
-  const coordSystem = registerCoordSystem({
-    feetPerInch: scaleInfo.feetPerInch,
-    dpi: scaleInfo.dpi,
-    northAngleDeg,
-    anchorPixel: anchorPx,
-    scaleText: scaleInfo.scaleText,
-  });
+  // ─── Step 6: Sub-pixel refinement ───────────────────────
+  if (bestMonument && traversePoints.length >= 2) {
+    onProgress("Refining anchor position…");
+    const baseX = Math.round(bestMonument.center.x);
+    const baseY = Math.round(bestMonument.center.y);
+    let refinedX = baseX;
+    let refinedY = baseY;
+    let refinedScore = bestScore;
+
+    for (let dx = -4; dx <= 4; dx++) {
+      for (let dy = -4; dy <= 4; dy++) {
+        if (dx === 0 && dy === 0) continue;
+        const cs = registerCoordSystem({
+          feetPerInch: scaleInfo.feetPerInch,
+          dpi: scaleInfo.dpi,
+          northAngleDeg,
+          anchorPixel: { px: baseX + dx, py: baseY + dy },
+          scaleText: scaleInfo.scaleText,
+        });
+        const projected = traversePoints.map((p) => surveyToPixel(cs, p));
+        const { score } = scorePlacement(projected, svgFeatures);
+        if (score > refinedScore) {
+          refinedScore = score;
+          refinedX = baseX + dx;
+          refinedY = baseY + dy;
+        }
+      }
+    }
+
+    if (refinedScore > bestScore) {
+      bestScore = refinedScore;
+      bestCS = registerCoordSystem({
+        feetPerInch: scaleInfo.feetPerInch,
+        dpi: scaleInfo.dpi,
+        northAngleDeg,
+        anchorPixel: { px: refinedX, py: refinedY },
+        scaleText: scaleInfo.scaleText,
+      });
+      onProgress(`Refined anchor by (${refinedX - baseX}, ${refinedY - baseY})px — score ${refinedScore.toFixed(3)}`);
+    }
+  }
+
+  // ─── Fallback: if no monuments found, use VLM coarse estimate ──
+  if (!bestCS) {
+    onProgress("WARNING: No monument candidates found — using center of lot region as fallback");
+    const fallbackPixel = {
+      px: Math.round(cropRegion.x + cropRegion.width / 2),
+      py: Math.round(cropRegion.y + cropRegion.height / 2),
+    };
+    bestCS = registerCoordSystem({
+      feetPerInch: scaleInfo.feetPerInch,
+      dpi: scaleInfo.dpi,
+      northAngleDeg,
+      anchorPixel: fallbackPixel,
+      scaleText: scaleInfo.scaleText,
+    });
+    bestScore = 0;
+  }
+
+  const anchorPx = bestCS.anchorPixel;
+  const validated = bestScore > 0.4;
+  onProgress(`Anchor: (${anchorPx.px}, ${anchorPx.py}) — alignment score ${bestScore.toFixed(3)}${validated ? " [VALIDATED]" : " [low confidence]"}`);
 
   return {
-    coordSystem,
+    coordSystem: bestCS,
     anchorPixel: anchorPx,
-    matchConfidence: validated ? 0.9 : 0.3,
+    matchConfidence: bestScore,
     cropRegion,
     validated,
-    matches: [],
+    matches: segments.map((s) => ({ bearing: s.bearing, distance: s.distance })),
+    svgFeatures,
   };
 }

@@ -23,6 +23,11 @@ export interface VectorizeResult {
   height: number;
 }
 
+export interface VectorizeFullResult extends VectorizeResult {
+  /** Raw SVG string from potrace (full page, original coordinates) */
+  rawSvg: string;
+}
+
 /**
  * Render a specific page of a PDF to PNG via mupdf WASM.
  * Returns base64 PNG + dimensions.
@@ -87,6 +92,40 @@ export async function vectorize(
 
     const paths = parseSvgPaths(svg, imageHeight);
     return { paths, width: imageWidth, height: imageHeight };
+  } finally {
+    await unlink(pngPath).catch(() => {});
+  }
+}
+
+/**
+ * Vectorize a PNG using potrace and return the raw SVG string.
+ * Same as vectorize() but retains the SVG for geometric analysis.
+ */
+export async function vectorizeToSvg(
+  pngBase64: string,
+  imageWidth: number,
+  imageHeight: number,
+): Promise<VectorizeFullResult> {
+  // eslint-disable-next-line @typescript-eslint/no-require-imports
+  const potrace = require("potrace");
+  const pngBuf = Buffer.from(pngBase64, "base64");
+
+  const id = Math.random().toString(36).slice(2);
+  const pngPath = join(tmpdir(), `trace-full-${id}.png`);
+  await writeFile(pngPath, pngBuf);
+
+  try {
+    const svg: string = await new Promise((resolve, reject) => {
+      potrace.trace(
+        pngPath,
+        { threshold: 128, turdSize: 5, optCurve: true },
+        (err: Error | null, result: string) =>
+          err ? reject(err) : resolve(result),
+      );
+    });
+
+    const paths = parseSvgPaths(svg, imageHeight);
+    return { paths, width: imageWidth, height: imageHeight, rawSvg: svg };
   } finally {
     await unlink(pngPath).catch(() => {});
   }

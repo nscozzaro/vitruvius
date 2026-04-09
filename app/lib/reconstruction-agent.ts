@@ -94,6 +94,8 @@ export interface PageInfo {
   width: number;
   height: number;
   pngBase64: string; // kept in memory for cropping during steps
+  /** SVG features extracted from potrace — used for geometric verification */
+  svgFeatures?: import("./svg-features").SvgFeatureMap;
 }
 
 export interface InitResult {
@@ -116,6 +118,12 @@ export interface StepResult {
   calibratedCoordSystem?: CoordSystem;
   /** Small JPEG thumbnail of the crop sent to the model (for user to follow along) */
   cropThumbnail?: string;
+  /** True when SVG verification indicates the anchor is fundamentally wrong */
+  anchorFailed?: boolean;
+  /** True when consecutive low-quality elements suggest extraction should stop */
+  haltRecommended?: boolean;
+  /** If SVG verification detected a consistent offset, report it */
+  suggestedAnchorCorrection?: { dx: number; dy: number };
 }
 
 // ─── Page cache (module-scoped, lives for the session) ───────
@@ -241,6 +249,16 @@ export async function initSession(
     onProgress,
   );
   const coordSystem = registration.coordSystem;
+
+  // Store SVG features on the page for reuse during step execution
+  if (registration.svgFeatures) {
+    mapPage.svgFeatures = registration.svgFeatures;
+    pageCache.set(
+      pages.length > 1 ? `bk${book}-pg${pages[1].pageNumber}` : `bk${book}-pg${pages[0].pageNumber}`,
+      mapPage,
+    );
+  }
+
   onProgress(`Anchor at (${registration.anchorPixel.px}, ${registration.anchorPixel.py}) — ${registration.matches.length} legs matched (confidence: ${(registration.matchConfidence * 100).toFixed(0)}%)`);
 
   // 7. Build extraction plan
@@ -276,6 +294,7 @@ export async function executeStep(
   planItem: ExtractionPlanItem,
   previousOverlapScore: number | null,
   monumentLegend: MonumentLegendEntry[],
+  consecutiveLowCount = 0,
 ): Promise<StepResult> {
   const page = pageCache.get(pageKey);
   if (!page) throw new Error(`Page not in cache: ${pageKey}`);
@@ -284,6 +303,7 @@ export async function executeStep(
   let bestElement: SurveyElement | null = null;
   let bestOverlap = -1;
   let bestParsed: ExtractionResponse | null = null;
+  let svgVerification: import("./svg-verify").VerificationResult | null = null;
 
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     // Compute crop region — widen on retries
@@ -338,11 +358,24 @@ export async function executeStep(
       monumentLegend,
     );
 
-    // Measure overlap
+    // Measure overlap — prefer SVG verification, fall back to raster
     let overlapScore = 0;
     let measuredStrokeWidth = 0;
 
-    if (element.geometryType === "point") {
+    if (page.svgFeatures) {
+      const { verifyElementPlacement } = await import("./svg-verify");
+      const thisVerification = verifyElementPlacement(
+        element,
+        page.svgFeatures,
+        coordSystem,
+        planItem.index <= 1,
+        consecutiveLowCount,
+      );
+      overlapScore = thisVerification.score;
+      // Keep the verification for the best-scoring attempt
+      if (overlapScore > bestOverlap) svgVerification = thisVerification;
+      console.log(`[step ${planItem.index}] SVG verify: score=${thisVerification.score.toFixed(3)} avgDist=${thisVerification.avgDistPx.toFixed(1)}px${thisVerification.estimatedOffset ? ` offset=(${thisVerification.estimatedOffset.dx},${thisVerification.estimatedOffset.dy})` : ""}`);
+    } else if (element.geometryType === "point") {
       const center = element.pixelPoints[0];
       if (center) {
         const result = await measureMonumentOverlap(
@@ -401,10 +434,32 @@ export async function executeStep(
 
   const calibratedCS: CoordSystem | undefined = undefined;
 
-  // ─── Quality gate: if first element has 0% overlap, warn the client ──
-  if (planItem.index <= 1 && bestOverlap === 0) {
-    console.log(`[step ${planItem.index}] WARNING: First element has 0% overlap — anchor is likely wrong`);
-    element.description += " [WARNING: 0% overlap — anchor may be misplaced]";
+  // ─── Quality gates ──────────────────────────────────────────
+  // svgVerification was captured during the overlap measurement loop above
+  let anchorFailed = false;
+  let haltRecommended = false;
+  let suggestedAnchorCorrection: { dx: number; dy: number } | undefined;
+
+  if (svgVerification) {
+    anchorFailed = svgVerification.anchorFailed;
+    haltRecommended = svgVerification.haltRecommended;
+    if (svgVerification.estimatedOffset) {
+      suggestedAnchorCorrection = {
+        dx: svgVerification.estimatedOffset.dx,
+        dy: svgVerification.estimatedOffset.dy,
+      };
+    }
+  }
+
+  if (planItem.index <= 1 && bestOverlap < 0.1) {
+    anchorFailed = true;
+    console.log(`[step ${planItem.index}] ANCHOR FAILED: first element score ${bestOverlap.toFixed(3)}`);
+    element.description += " [ANCHOR FAILED — placement is wrong]";
+  }
+
+  if (consecutiveLowCount >= 2 && bestOverlap < 0.2) {
+    haltRecommended = true;
+    console.log(`[step ${planItem.index}] HALT RECOMMENDED: ${consecutiveLowCount + 1} consecutive low-quality elements`);
   }
 
   // Build SVG fragments
@@ -420,6 +475,9 @@ export async function executeStep(
     nextBearing,
     calibratedCoordSystem: calibratedCS,
     cropThumbnail,
+    anchorFailed,
+    haltRecommended,
+    suggestedAnchorCorrection,
   };
 }
 

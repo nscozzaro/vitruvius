@@ -33,7 +33,7 @@ interface NimResponse {
 }
 
 function getApiKey(): string {
-  const key = process.env.NVIDIA_NIM_API_KEY;
+  const key = process.env.NVIDIA_NIM_API_KEY ?? process.env.NVIDIA_API_KEY;
   if (!key) throw new Error("NVIDIA_NIM_API_KEY not set");
   return key;
 }
